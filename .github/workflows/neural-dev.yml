@@ -9,8 +9,14 @@ on:
         description: 'Exact behavioral-v3.1-* Release tag'
         required: true
         type: string
+      reuse_run_id:
+        description: 'Optional prior neural DEV run ID whose successful shard artifacts should be reused'
+        required: false
+        default: ''
+        type: string
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -40,22 +46,39 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
         run: |
           case "$BEHAVIOR_TAG" in behavioral-v3.1-*) ;; *) echo "::error::exact behavioral-v3.1 tag required"; exit 1;; esac
-          mkdir -p run/source run/behavior run/split
-          gh release download "$BEHAVIOR_TAG" --dir run/source
+          mkdir -p run
+          if [ -n "$REUSE_RUN_ID" ]; then
+            case "$REUSE_RUN_ID" in *[!0-9]*|'') echo "::error::reuse_run_id must be numeric"; exit 1;; esac
+            workflow=$(gh run view "$REUSE_RUN_ID" --json workflowName --jq .workflowName)
+            title=$(gh run view "$REUSE_RUN_ID" --json displayTitle --jq .displayTitle)
+            test "$workflow" = 'neural DEV v3.1 from behavioral Release'
+            test "$title" = "neural DEV · $BEHAVIOR_TAG"
+            gh run download "$REUSE_RUN_ID" -n neural-dev-input -D run
+          else
+            mkdir -p run/source run/behavior run/split
+            gh release download "$BEHAVIOR_TAG" --dir run/source
+          fi
           cd run/source
           sha256sum --check SHA256SUMS
-          tar -xzf dev-bundles.tar.gz -C ../behavior
-          tar -xzf behavioral-v3.1-scan.tar.gz -C ../behavior
-          tar -xzf source-split.tar.gz -C ..
+          if [ -z "$REUSE_RUN_ID" ]; then
+            tar -xzf dev-bundles.tar.gz -C ../behavior
+            tar -xzf behavioral-v3.1-scan.tar.gz -C ../behavior
+            tar -xzf source-split.tar.gz -C ..
+          fi
           test -s ../behavior/behavioral-manifest.json
           test -s ../split/dev_mice.csv
       - name: Derive exact 70-experiment Appendix-A manifest
+        env:
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
         run: |
-          python pipeline/verify-neural/neural.py manifest \
-            --ids-from run/split/dev_mice.csv \
-            --out run/dev_experiments.csv --cache "$RUNNER_TEMP/allen-meta"
+          if [ -z "$REUSE_RUN_ID" ]; then
+            python pipeline/verify-neural/neural.py manifest \
+              --ids-from run/split/dev_mice.csv \
+              --out run/dev_experiments.csv --cache "$RUNNER_TEMP/allen-meta"
+          fi
           test "$(($(wc -l < run/dev_experiments.csv)-1))" -eq 70
       - name: Upload verified inputs
         uses: actions/upload-artifact@v7
@@ -67,6 +90,7 @@ jobs:
 
   pull:
     needs: resolve
+    if: ${{ inputs.reuse_run_id == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 150
     strategy:
@@ -111,6 +135,7 @@ jobs:
 
   analyze:
     needs: [resolve, pull]
+    if: ${{ always() && needs.resolve.result == 'success' && (needs.pull.result == 'success' || needs.pull.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -127,11 +152,24 @@ jobs:
           name: neural-dev-input
           path: run
       - uses: actions/download-artifact@v8
+        if: ${{ inputs.reuse_run_id == '' }}
         with:
           pattern: neural-container-*
           path: run/neural
           merge-multiple: true
+      - name: Restore prior successful container artifacts
+        if: ${{ inputs.reuse_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+        run: |
+          mkdir -p run/neural
+          for shard in $(seq 1 10); do
+            gh run download "$REUSE_RUN_ID" -n "neural-container-$shard" -D run/neural
+          done
       - name: Run Q1 Q2 SESOI and gates
+        env:
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
         run: |
           set -o pipefail
           mkdir -p run/analysis
@@ -165,6 +203,7 @@ jobs:
                 'code_commit':os.environ['GITHUB_SHA'],'python':platform.python_version(),
                 'runner_os':os.environ.get('ImageOS',os.environ.get('RUNNER_OS')),
                 'runner_image_version':os.environ.get('ImageVersion'),
+                'reused_shard_run':int(os.environ['REUSE_RUN_ID']) if os.environ.get('REUSE_RUN_ID') else None,
                 'pip_freeze_sha256':hashlib.sha256(env).hexdigest()}
           Path('run/provenance.json').write_text(json.dumps(data,indent=2)+'\n')
           PY
@@ -194,14 +233,26 @@ jobs:
           name: neural-dev-result
           path: run
       - uses: actions/download-artifact@v8
+        if: ${{ inputs.reuse_run_id == '' }}
         with:
           pattern: neural-container-*
           path: run/neural
           merge-multiple: true
+      - name: Restore prior successful container artifacts
+        if: ${{ inputs.reuse_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+        run: |
+          mkdir -p run/neural
+          for shard in $(seq 1 10); do
+            gh run download "$REUSE_RUN_ID" -n "neural-container-$shard" -D run/neural
+          done
       - name: Stream container shards into immutable DEV neural Release
         env:
           GH_TOKEN: ${{ github.token }}
           BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
         run: |
           tag="neural-dev-${GITHUB_RUN_ID}"
           mkdir -p assets
@@ -211,6 +262,7 @@ jobs:
           analysis=json.loads(Path('run/analysis/analysis-manifest.json').read_text())
           manifest={'schema':'neural-dev-release-v3.1','behavioral_release':os.environ['BEHAVIOR_TAG'],
                     'code_commit':os.environ['GITHUB_SHA'],'n_experiments':70,
+                    'reused_shard_run':int(os.environ['REUSE_RUN_ID']) if os.environ.get('REUSE_RUN_ID') else None,
                     'confirm_ready':analysis['section11']['confirm_ready'],
                     'analysis_manifest':analysis,
                     'workflow_run':f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
@@ -218,8 +270,10 @@ jobs:
           PY
           ready=$(python -c 'import json; print(str(json.load(open("assets/neural-manifest.json"))["confirm_ready"]).lower())')
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          printf '# Neural DEV v3.1\n\n- Behavioral source: `%s`\n- Code: `%s`\n- Run: %s\n- `confirm_ready`: **%s**\n\nThis Release contains DEV only. A false gate is a diagnostic result and does not authorize a CONFIRM run.\n' \
-            "$BEHAVIOR_TAG" "$GITHUB_SHA" "$run_url" "$ready" > release-notes.md
+          reuse_note="none (fresh DEV extraction)"
+          if [ -n "$REUSE_RUN_ID" ]; then reuse_note="$REUSE_RUN_ID (existing DEV shard artifacts; no NWB re-download)"; fi
+          printf '# Neural DEV v3.1\n\n- Behavioral source: `%s`\n- Code: `%s`\n- Run: %s\n- Reused shard run: `%s`\n- `confirm_ready`: **%s**\n\nThis Release contains DEV only. A false gate is a diagnostic result and does not authorize a CONFIRM run.\n' \
+            "$BEHAVIOR_TAG" "$GITHUB_SHA" "$run_url" "$reuse_note" "$ready" > release-notes.md
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --target "$GITHUB_SHA" --title "$tag: DEV neural v3.1" \
               --notes-file release-notes.md --latest=false --draft

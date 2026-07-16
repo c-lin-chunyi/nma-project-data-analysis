@@ -735,6 +735,11 @@ def _weighted_random_intercept(df: pd.DataFrame, *, include_novel: bool) -> dict
     if include_novel: use = use[use.novel.notna()].copy()
     if len(use) < 3 or use.mouse_id.nunique() < 2:
         return {"error": "insufficient data"}
+    if include_novel and use.novel.astype(bool).nunique() < 2:
+        return {"error": "nonestimable_no_novelty_variation",
+                "n_sessions": int(len(use)), "n_mice": int(use.mouse_id.nunique()),
+                "observed_novel_levels": sorted(
+                    map(bool, use.novel.astype(bool).unique().tolist()))}
     project_levels = sorted(use.project_code.astype(str).unique())
     if len(project_levels) != 2: return {"error": "project_code is not binary"}
     columns = [np.ones(len(use)),
@@ -743,6 +748,12 @@ def _weighted_random_intercept(df: pd.DataFrame, *, include_novel: bool) -> dict
     if include_novel:
         columns.append(np.where(use.novel.astype(bool), .5, -.5)); names.append("novel:true-false")
     X, y = np.column_stack(columns), use.auc.to_numpy(float)
+    rank = int(np.linalg.matrix_rank(X))
+    if rank < X.shape[1]:
+        return {"error": "nonestimable_rank_deficient_fixed_effects",
+                "rank": rank, "n_fixed_effects": int(X.shape[1]),
+                "fixed_effects": names, "n_sessions": int(len(use)),
+                "n_mice": int(use.mouse_id.nunique())}
     weights = np.maximum(use.miss_B.to_numpy(float), 1.0)
     groups = use.mouse_id.to_numpy()
 
@@ -761,12 +772,27 @@ def _weighted_random_intercept(df: pd.DataFrame, *, include_novel: bool) -> dict
                    for idx, inv in pieces)
         return .5 * (logdet + quad), beta, np.linalg.inv(precision)
     fit = minimize(lambda z: solve(z)[0], np.log([.01, .01]), method="Nelder-Mead")
+    if not fit.success or not np.isfinite(fit.fun):
+        return {"error": "variance_optimizer_failed", "message": str(fit.message),
+                "n_sessions": int(len(use)), "n_mice": int(use.mouse_id.nunique())}
     _, beta, cov = solve(fit.x)
     return {"converged": bool(fit.success), "params": dict(zip(names, map(float, beta))),
             "standard_errors": dict(zip(names, map(float, np.sqrt(np.diag(cov))))),
             "residual_variance": float(np.exp(fit.x[0])),
             "between_mouse_variance": float(np.exp(fit.x[1])), "n_sessions": int(len(use)),
             "n_mice": int(use.mouse_id.nunique()), "weights": "n_engaged_miss"}
+
+
+def _safe_secondary_model(df: pd.DataFrame, *, include_novel: bool) -> dict:
+    """A secondary diagnostic must never prevent primary results from publishing."""
+    try:
+        return _weighted_random_intercept(df, include_novel=include_novel)
+    except Exception as exc:
+        numerical = isinstance(exc, (np.linalg.LinAlgError, FloatingPointError, ValueError))
+        return {"error": ("secondary_model_numerical_failure" if numerical else
+                          "secondary_model_unexpected_failure"),
+                "exception": type(exc).__name__, "message": str(exc),
+                "n_sessions_input": int(len(df))}
 
 
 def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path) -> int:
@@ -994,8 +1020,8 @@ def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path) -
         "q2_nuisance_model": {"regularization": "L2", "C": 1.0,
                               "selection": "fixed; not tuned on outcomes"},
         "secondary_models": {
-            "v3.1_project_only": _weighted_random_intercept(primary_df, include_novel=False),
-            "frozen_v3_project_plus_novel": _weighted_random_intercept(
+            "v3.1_project_only": _safe_secondary_model(primary_df, include_novel=False),
+            "frozen_v3_project_plus_novel": _safe_secondary_model(
                 pd.DataFrame(frozen_rows), include_novel=True),
         },
     }

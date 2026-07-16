@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -113,6 +114,40 @@ class NeuralTests(unittest.TestCase):
                               "mouse_mean_auc": [.69, .70, .705],
                               "mouse_se": [.01, .01, .02]})
         self.assertEqual(neural._choose_one_se(block), .01)
+
+    def test_frozen_secondary_reports_absent_novelty_without_crashing(self):
+        rows = pd.DataFrame({
+            "auc": [.55, .60, .65, .70], "novel": [False] * 4,
+            "mouse_id": [1, 1, 2, 2], "miss_B": [20] * 4,
+            "project_code": ["A", "A", "B", "B"],
+        })
+        result = neural._safe_secondary_model(rows, include_novel=True)
+        self.assertEqual(result["error"], "nonestimable_no_novelty_variation")
+        self.assertEqual(result["observed_novel_levels"], [False])
+
+    def test_secondary_numerical_failure_is_diagnostic(self):
+        rows = pd.DataFrame({"auc": [.5]})
+        with mock.patch.object(neural, "_weighted_random_intercept",
+                               side_effect=np.linalg.LinAlgError("singular")):
+            result = neural._safe_secondary_model(rows, include_novel=False)
+        self.assertEqual(result["error"], "secondary_model_numerical_failure")
+
+    def test_secondary_detects_collinear_fixed_effects(self):
+        rows = pd.DataFrame({
+            "auc": [.55, .60, .65, .70], "novel": [False, False, True, True],
+            "mouse_id": [1, 1, 2, 2], "miss_B": [20] * 4,
+            "project_code": ["A", "A", "B", "B"],
+        })
+        result = neural._safe_secondary_model(rows, include_novel=True)
+        self.assertEqual(result["error"], "nonestimable_rank_deficient_fixed_effects")
+        self.assertEqual(result["rank"], 2)
+
+    def test_recovery_workflow_skips_nwb_pull_and_reuses_artifacts(self):
+        workflow = (ROOT / ".github/workflows/neural-dev.yml").read_text()
+        self.assertIn("reuse_run_id:", workflow)
+        self.assertIn("if: ${{ inputs.reuse_run_id == '' }}", workflow)
+        self.assertIn('gh run download "$REUSE_RUN_ID" -n "neural-container-$shard"',
+                      workflow)
 
 
 if __name__ == "__main__":
