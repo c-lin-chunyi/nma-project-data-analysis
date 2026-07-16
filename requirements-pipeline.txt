@@ -1,0 +1,2 @@
+allensdk==2.16.2
+pyarrow==24.0.0
