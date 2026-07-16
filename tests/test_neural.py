@@ -215,6 +215,11 @@ class NeuralTests(unittest.TestCase):
         self.assertIn("--draft=false", workflow)
         self.assertNotIn("neural.py pull", workflow)
         self.assertNotIn("neural.py manifest", workflow)
+        self.assertNotIn("must contain 7 experiments", workflow)
+        self.assertIn("manifest must contain 70 experiments", workflow)
+        self.assertIn("manifest experiment IDs must be unique", workflow)
+        self.assertIn("manifest must contain exactly 10 containers", workflow)
+        self.assertIn("has no manifest experiments", workflow)
 
     def test_v32_prereg_freezes_unbaselined_prechange_anchor(self):
         text = (ROOT / "prereg_v3.2.md").read_text()

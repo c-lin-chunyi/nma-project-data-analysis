@@ -102,9 +102,15 @@ jobs:
           spec=importlib.util.spec_from_file_location('neural_pipeline','pipeline/verify-neural/neural.py')
           neural=importlib.util.module_from_spec(spec); spec.loader.exec_module(neural)
           manifest=pd.read_csv('run/input/dev_experiments.csv')
+          if len(manifest) != 70:
+              raise SystemExit(f'manifest must contain 70 experiments; got {len(manifest)}')
+          if manifest.ophys_experiment_id.astype(int).nunique() != 70:
+              raise SystemExit('manifest experiment IDs must be unique')
+          if manifest.ophys_container_id.astype(int).nunique() != 10:
+              raise SystemExit('manifest must contain exactly 10 containers')
           selected=manifest[manifest.ophys_container_id.astype(int).eq(container)].copy()
-          if len(selected) != 7:
-              raise SystemExit(f'container {container} must contain 7 experiments; got {len(selected)}')
+          if selected.empty:
+              raise SystemExit(f'container {container} has no manifest experiments')
           neural.validate_bundles(root, selected)
           failures=neural.appendix_a_failures(root, selected)
           if failures:
