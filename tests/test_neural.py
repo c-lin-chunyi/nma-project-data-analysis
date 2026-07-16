@@ -208,6 +208,10 @@ class NeuralTests(unittest.TestCase):
         self.assertIn("allen_nwb_download=false", workflow)
         self.assertIn("split -b 1800M", workflow)
         self.assertIn("--prerelease --draft", workflow)
+        self.assertIn('--target "$GITHUB_SHA"', workflow)
+        self.assertNotIn('--target "$source_sha"', workflow)
+        self.assertLess(workflow.index("smoke-test Release permission"),
+                        workflow.index("actions/setup-python@v6"))
         self.assertIn("--draft=false", workflow)
         self.assertNotIn("neural.py pull", workflow)
         self.assertNotIn("neural.py manifest", workflow)

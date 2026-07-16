@@ -33,14 +33,7 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: requirements-pipeline.txt
-      - name: Install pinned validation dependencies
-        run: python -m pip install -r requirements-pipeline.txt
-      - name: Validate source and create immutable draft
+      - name: Validate source and smoke-test Release permission
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
@@ -55,8 +48,6 @@ jobs:
           test "$workflow" = 'neural DEV v3.1 from behavioral Release'
           test "$title" = "neural DEV · $BEHAVIOR_TAG"
           mkdir -p run/input work assets/extraction-reports
-          gh run download "$SOURCE_RUN_ID" -n neural-dev-input -D run/input
-          test "$(($(wc -l < run/input/dev_experiments.csv)-1))" -eq 70
           tag="neural-dev-data-${SOURCE_RUN_ID}"
           if gh release view "$tag" >/dev/null 2>&1; then
             draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
@@ -67,15 +58,24 @@ jobs:
           else
             printf '# Neural DEV data package\n\n- Source extraction run: `%s`\n- Source commit: `%s`\n- Behavioral source: `%s`\n- Allen NWB re-download: **false**\n\nThe Release remains a draft until every container part and checksum is uploaded.\n' \
               "$SOURCE_RUN_ID" "$source_sha" "$BEHAVIOR_TAG" > release-notes.md
-            gh release create "$tag" --target "$source_sha" --title "$tag: immutable DEV neural bundles" \
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$tag: immutable DEV neural bundles" \
               --notes-file release-notes.md --latest=false --prerelease --draft
           fi
+          gh run download "$SOURCE_RUN_ID" -n neural-dev-input -D run/input
+          test "$(($(wc -l < run/input/dev_experiments.csv)-1))" -eq 70
           printf '%s\n' "$source_sha" > run/source-head-sha.txt
           : > assets/SHA256SUMS
           : > assets/bundle-files.sha256
           : > assets/parts.tsv
           echo 'analysis_only_packaging=true'
           echo 'allen_nwb_download=false'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pinned validation dependencies
+        run: python -m pip install -r requirements-pipeline.txt
       - name: Validate, stream-split and upload ten containers
         env:
           GH_TOKEN: ${{ github.token }}
