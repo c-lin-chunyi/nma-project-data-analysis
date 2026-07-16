@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -109,11 +110,56 @@ class NeuralTests(unittest.TestCase):
                 self.assertIn("pupil", h5["trial_locked"])
                 self.assertIn("running", h5["trial_locked"])
 
-    def test_one_se_rule_chooses_strongest_regularization(self):
-        block = pd.DataFrame({"C": [.01, .1, 1.0],
-                              "mouse_mean_auc": [.69, .70, .705],
-                              "mouse_se": [.01, .01, .02]})
-        self.assertEqual(neural._choose_one_se(block), .01)
+    def test_v32_freezes_only_k50_and_c50(self):
+        self.assertEqual(neural.PRIMARY_K, 50)
+        self.assertEqual(neural.FROZEN_C50, 1e-4)
+        self.assertFalse(hasattr(neural, "K_GRID"))
+        self.assertFalse(hasattr(neural, "C_GRID"))
+
+    def test_unbaselined_tonic_state_anchor_has_auc_and_logloss_gain(self):
+        rng = np.random.default_rng(4)
+        y = np.tile([0, 1], 60)
+        X = rng.normal(scale=.5, size=(len(y), 50)) + y[:, None] * .8
+        auc, gain, error = neural._state_oof_metrics(
+            X, y, np.arange(len(y)), neural.FROZEN_C50, seed=0)
+        self.assertIsNone(error)
+        self.assertGreater(auc, .9)
+        self.assertGreater(gain, 0)
+
+    def test_both_q1_and_q2_precision_are_required(self):
+        passed = neural._precision_gates(
+            appendix_complete=True, q1_mice=8, anchor_mice=8, q2_mice=8,
+            q1_sd=.01, q2_sd=.001, q1_margin=.02, q2_sesoi=.002)
+        self.assertTrue(passed["confirm_ready"])
+        q2_failed = neural._precision_gates(
+            appendix_complete=True, q1_mice=8, anchor_mice=8, q2_mice=8,
+            q1_sd=.01, q2_sd=.02, q1_margin=.02, q2_sesoi=.002)
+        self.assertTrue(q2_failed["q1_precision"])
+        self.assertFalse(q2_failed["q2_precision"])
+        self.assertFalse(q2_failed["confirm_ready"])
+
+    def test_baseline_integrity_uses_within_fold_constant_dv(self):
+        rng = np.random.default_rng(8)
+        y = np.tile([False, True], 50)
+        labels = pd.DataFrame({
+            "engaged_B": True, "keep_B": True, "late_hit": y,
+            "miss": ~y, "trial_index": np.arange(len(y)),
+        })
+        item = {"X": rng.normal(size=(len(y), 50)),
+                "baseline_pre": np.zeros((len(y), 50)),
+                "labels": labels, "meta": {"ophys_experiment_id": 123}}
+        result = neural._baseline_integrity(item, neural.FROZEN_C50)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["constant_score_auc"], .5)
+        self.assertEqual(result["max_prechange_mean_dv_range"], 0)
+
+    def test_q2_nuisance_models_use_natural_prevalence(self):
+        source = inspect.getsource(neural._q2_session)
+        self.assertIn('class_weight=None', source)
+        self.assertIn('"m0_log_loss"', source)
+        self.assertIn('"m1_log_loss"', source)
+        self.assertIn('"m0_brier"', source)
+        self.assertIn('"q1_auc_same_trials"', source)
 
     def test_frozen_secondary_reports_absent_novelty_without_crashing(self):
         rows = pd.DataFrame({
@@ -142,12 +188,35 @@ class NeuralTests(unittest.TestCase):
         self.assertEqual(result["error"], "nonestimable_rank_deficient_fixed_effects")
         self.assertEqual(result["rank"], 2)
 
-    def test_recovery_workflow_skips_nwb_pull_and_reuses_artifacts(self):
-        workflow = (ROOT / ".github/workflows/neural-dev.yml").read_text()
-        self.assertIn("reuse_run_id:", workflow)
-        self.assertIn("if: ${{ inputs.reuse_run_id == '' }}", workflow)
-        self.assertIn('gh run download "$REUSE_RUN_ID" -n "neural-container-$shard"',
-                      workflow)
+    def test_v32_workflow_reads_immutable_data_release_and_cannot_pull_nwb(self):
+        workflow = (ROOT / ".github/workflows/neural-dev-v3.2.yml").read_text()
+        self.assertIn("neural_data_release:", workflow)
+        self.assertIn("analysis_only=true", workflow)
+        self.assertIn("allen_nwb_download=false", workflow)
+        self.assertIn('gh release download "$DATA_TAG"', workflow)
+        self.assertIn("bundle-files.sha256", workflow)
+        self.assertNotIn("gh run download", workflow)
+        self.assertNotIn("neural.py pull", workflow)
+        self.assertNotIn("neural.py manifest", workflow)
+        self.assertNotIn("allen-neural", workflow)
+
+    def test_neural_data_backfill_streams_existing_artifacts_to_draft_release(self):
+        workflow = (ROOT / ".github/workflows/neural-data-backfill.yml").read_text()
+        self.assertIn("source_run_id:", workflow)
+        self.assertIn('gh run download "$SOURCE_RUN_ID"', workflow)
+        self.assertIn("analysis_only_packaging=true", workflow)
+        self.assertIn("allen_nwb_download=false", workflow)
+        self.assertIn("split -b 1800M", workflow)
+        self.assertIn("--prerelease --draft", workflow)
+        self.assertIn("--draft=false", workflow)
+        self.assertNotIn("neural.py pull", workflow)
+        self.assertNotIn("neural.py manifest", workflow)
+
+    def test_v32_prereg_freezes_unbaselined_prechange_anchor(self):
+        text = (ROOT / "prereg_v3.2.md").read_text()
+        self.assertIn("unbaselined events mean in `[-1,0)`", text)
+        self.assertIn("K=50 remains the only authoritative", text)
+        self.assertIn("Q2 precision requires", text)
 
 
 if __name__ == "__main__":

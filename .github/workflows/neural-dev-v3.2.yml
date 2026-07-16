@@ -1,0 +1,219 @@
+name: neural DEV v3.2 analysis-only
+
+run-name: neural DEV v3.2 · ${{ inputs.neural_data_release }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      behavioral_release:
+        description: 'Exact behavioral-v3.1-* Release tag'
+        required: true
+        type: string
+      neural_data_release:
+        description: 'Exact neural-dev-data-* Release tag containing the immutable 70-bundle package'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: neural-dev-v3.2-${{ inputs.neural_data_release }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pinned pipeline
+        run: python -m pip install -r requirements-pipeline.txt
+      - name: Resolve immutable neural and behavioral Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATA_TAG: ${{ inputs.neural_data_release }}
+          BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          set -euo pipefail
+          case "$DATA_TAG" in neural-dev-data-*) ;; *) echo "::error::exact neural-dev-data tag required"; exit 1;; esac
+          case "$BEHAVIOR_TAG" in behavioral-v3.1-*) ;; *) echo "::error::exact behavioral-v3.1 tag required"; exit 1;; esac
+          test "$(gh release view "$DATA_TAG" --json isDraft --jq .isDraft)" = false
+          mkdir -p run/data-source run/behavior-source run/behavior run/neural run/packages
+          for asset in SHA256SUMS bundle-files.sha256 data-package-manifest.json \
+                       dev_experiments.csv behavioral-manifest.json neural-data-provenance.json; do
+            gh release download "$DATA_TAG" -p "$asset" -D run/data-source
+          done
+          (cd run/data-source && \
+            grep -E '  (bundle-files.sha256|data-package-manifest.json|dev_experiments.csv|behavioral-manifest.json|neural-data-provenance.json)$' SHA256SUMS | sha256sum --check -)
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest=json.loads(Path('run/data-source/data-package-manifest.json').read_text())
+          assert manifest['schema']=='neural-dev-data-v1'
+          assert manifest['n_experiments']==70 and manifest['n_containers']==10
+          assert manifest['behavioral_release']==os.environ['BEHAVIOR_TAG']
+          assert manifest['allen_nwb_download'] is False
+          PY
+          gh release download "$BEHAVIOR_TAG" -p SHA256SUMS -p behavioral-v3.1-scan.tar.gz \
+            -p behavioral-manifest.json -D run/behavior-source
+          (cd run/behavior-source && \
+            grep -E '  (behavioral-v3.1-scan.tar.gz|behavioral-manifest.json)$' SHA256SUMS | sha256sum --check -)
+          tar -xzf run/behavior-source/behavioral-v3.1-scan.tar.gz -C run/behavior
+          cmp run/data-source/behavioral-manifest.json run/behavior-source/behavioral-manifest.json
+          test "$(($(wc -l < run/data-source/dev_experiments.csv)-1))" -eq 70
+          test -s run/behavior/_trial_labels.parquet
+          test -s run/behavior/_session_scan.parquet
+          echo 'analysis_only=true'
+          echo 'allen_nwb_download=false'
+      - name: Stream verified container parts from neural data Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATA_TAG: ${{ inputs.neural_data_release }}
+        run: |
+          set -euo pipefail
+          containers=$(python -c 'import pandas as pd; print(" ".join(map(str,sorted(pd.read_csv("run/data-source/dev_experiments.csv").ophys_container_id.astype(int).unique()))))')
+          for container in $containers; do
+            gh release download "$DATA_TAG" -p "neural-container-${container}.tar.part-*" -D run/packages
+            grep "  neural-container-${container}.tar.part-" run/data-source/SHA256SUMS > run/packages/checksums
+            (cd run/packages && sha256sum --check checksums)
+            cat run/packages/neural-container-${container}.tar.part-* | tar -xf - -C run/neural
+            rm -f run/packages/neural-container-${container}.tar.part-* run/packages/checksums
+          done
+          (cd run/neural && sha256sum --check ../data-source/bundle-files.sha256)
+      - name: Run frozen K50 v3.2 analysis
+        env:
+          DATA_TAG: ${{ inputs.neural_data_release }}
+        run: |
+          set -o pipefail
+          mkdir -p run/analysis
+          data_manifest_sha=$(sha256sum run/data-source/data-package-manifest.json | cut -d' ' -f1)
+          python pipeline/verify-neural/neural.py scan \
+            --manifest run/data-source/dev_experiments.csv --neural run/neural \
+            --behavior run/behavior --out run/analysis \
+            --data-release "$DATA_TAG" --data-manifest-sha256 "$data_manifest_sha" \
+            2>&1 | tee run/analysis/analysis.log
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          result=json.loads(Path('run/analysis/analysis-manifest.json').read_text())
+          assert result['schema']=='neural-dev-v3.2'
+          assert result['primary']['K']==50
+          assert result['k_policy']['other_K_computed'] is False
+          assert result['data_source']['neural_data_release']
+          text=Path('prereg_v3.2.md').read_text().rstrip()
+          anchor=result['anchor']['authoritative_guarded'] or {}
+          gates=result['gates']
+          lines=['','## DEV-frozen values (authoritative Release snapshot)','',
+                 '- `K = 50`', '- `C50 = 1e-4`',
+                 f"- `Neural data Release = {result['data_source']['neural_data_release']}`",
+                 f"- `AUC_state_guarded = {anchor.get('auc')}`",
+                 f"- `state_logloss_gain_guarded = {anchor.get('state_logloss_gain')}`",
+                 f"- `SESOI_Q1 = {result['sesoi']['q1_auc_boundary']}`",
+                 f"- `SESOI_Q2_delta_logloss = {result['sesoi']['q2_delta_logloss']}`",
+                 f"- `confirm_ready = {gates['confirm_ready']}`"]
+          Path('run/analysis/prereg_v3.2-frozen.md').write_text(text+'\n'+'\n'.join(lines)+'\n')
+          PY
+          python -m pip freeze > run/neural-v3.2-environment.txt
+          sha256sum requirements-pipeline.txt > run/environment-input.sha256
+          python - <<'PY'
+          import datetime, hashlib, json, os, platform
+          from pathlib import Path
+          env=Path('run/neural-v3.2-environment.txt').read_bytes()
+          data_manifest=Path('run/data-source/data-package-manifest.json')
+          source=json.loads(data_manifest.read_text())
+          data={'date_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'code_commit':os.environ['GITHUB_SHA'],'python':platform.python_version(),
+                'runner_os':os.environ.get('ImageOS',os.environ.get('RUNNER_OS')),
+                'runner_image_version':os.environ.get('ImageVersion'),
+                'neural_data_release':os.environ['DATA_TAG'],
+                'data_manifest_sha256':hashlib.sha256(data_manifest.read_bytes()).hexdigest(),
+                'source_extraction_run':source['source_extraction_run'],
+                'analysis_only':True,'allen_nwb_download':False,
+                'pip_freeze_sha256':hashlib.sha256(env).hexdigest()}
+          Path('run/provenance.json').write_text(json.dumps(data,indent=2)+'\n')
+          PY
+      - name: Upload v3.2 diagnostic result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: neural-dev-v3.2-result
+          path: |
+            run/analysis/
+            run/data-source/data-package-manifest.json
+            run/data-source/dev_experiments.csv
+            run/behavior/behavioral-manifest.json
+            run/neural-v3.2-environment.txt
+            run/environment-input.sha256
+            run/provenance.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  publish:
+    needs: analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-dev-v3.2-result
+          path: run
+      - name: Publish analysis-only public prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+          DATA_TAG: ${{ inputs.neural_data_release }}
+        run: |
+          set -euo pipefail
+          tag="neural-dev-v3.2-${GITHUB_RUN_ID}"
+          mkdir -p assets
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          analysis=json.loads(Path('run/analysis/analysis-manifest.json').read_text())
+          data_manifest=Path('run/data-source/data-package-manifest.json')
+          manifest={'schema':'neural-dev-release-v3.2',
+                    'behavioral_release':os.environ['BEHAVIOR_TAG'],
+                    'neural_data_release':os.environ['DATA_TAG'],
+                    'data_manifest_sha256':hashlib.sha256(data_manifest.read_bytes()).hexdigest(),
+                    'code_commit':os.environ['GITHUB_SHA'],'n_experiments':70,
+                    'analysis_only':True,'allen_nwb_download':False,
+                    'confirm_ready':analysis['gates']['confirm_ready'],
+                    'analysis_manifest':analysis,
+                    'workflow_run':f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
+          Path('assets/neural-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          PY
+          ready=$(python -c 'import json; print(str(json.load(open("assets/neural-manifest.json"))["confirm_ready"]).lower())')
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          printf '# Neural DEV v3.2 analysis\n\n- Behavioral source: `%s`\n- Neural data source: `%s`\n- Code: `%s`\n- Run: %s\n- K/C: `50 / 1e-4`\n- Allen NWB download: **false**\n- `confirm_ready`: **%s**\n\nLarge neural bundles live in the referenced immutable data Release and are not duplicated here.\n' \
+            "$BEHAVIOR_TAG" "$DATA_TAG" "$GITHUB_SHA" "$run_url" "$ready" > release-notes.md
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag: DEV neural v3.2 analysis" \
+            --notes-file release-notes.md --latest=false --prerelease --draft
+          python - <<'PY'
+          import tarfile
+          from pathlib import Path
+          with tarfile.open('assets/neural-v3.2-analysis.tar.gz','w:gz') as tar:
+              for path in sorted(Path('run/analysis').iterdir()): tar.add(path,arcname=path.name)
+          PY
+          cp run/analysis/prereg_v3.2-frozen.md run/neural-v3.2-environment.txt \
+            run/environment-input.sha256 run/provenance.json run/analysis/analysis-manifest.json \
+            run/behavior/behavioral-manifest.json run/data-source/data-package-manifest.json \
+            run/data-source/dev_experiments.csv assets/
+          mv assets/prereg_v3.2-frozen.md assets/prereg_v3.2.md
+          (cd assets && sha256sum neural-v3.2-analysis.tar.gz neural-manifest.json \
+            prereg_v3.2.md neural-v3.2-environment.txt environment-input.sha256 \
+            provenance.json analysis-manifest.json behavioral-manifest.json \
+            data-package-manifest.json dev_experiments.csv > SHA256SUMS)
+          gh release upload "$tag" assets/*
+          gh release edit "$tag" --draft=false --prerelease --latest=false

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""DEV-only Appendix-A extraction and v3.1 Q1/Q2 analysis.
+"""DEV-only Appendix-A extraction and v3.2 K=50 Q1/Q2 analysis.
 
 The public contract has three commands:
 
   manifest  derive the exact 50 active + 20 passive experiment set from DEV
   pull      download one container shard and publish atomic, lossless bundles
-  scan      freeze per-K C, run Q1/Q2, the single SESOI anchor, and §11 gates
+  scan      run frozen K=50 Q1/Q2, the single SESOI anchor, and precision gates
 
 No command accepts confirm_mice.csv.  Analysis selection is never baked into a
 bundle: the bundle contains Allen-QC cells, continuous traces, task tables and
@@ -32,8 +32,7 @@ GAP_RAW_TRIALS = 10
 N_BLOCKS = 5
 N_SEEDS = 10
 PRIMARY_K = 50
-K_GRID = (10, 25, 50, 100, 158, "all")
-C_GRID = tuple(float(x) for x in np.logspace(-4, 4, 9))
+FROZEN_C50 = 1e-4
 CONFIRM_MICE = 29
 
 BUNDLE_SUFFIXES = (
@@ -471,15 +470,21 @@ def _oof_auc(X: np.ndarray, y: np.ndarray, raw_index: np.ndarray, C: float,
     return float(roc_auc_score(y, scores)), scores, None
 
 
-def _session_data(root: Path, oeid: int, labels: pd.DataFrame, signal="events"):
+def _session_data(root: Path, oeid: int, labels: pd.DataFrame, signal="events",
+                  *, baselined: bool = True, start: float = FIT_START,
+                  end: float = FIT_END):
     import h5py
     with h5py.File(root / f"{oeid}.neural.h5", "r") as h5:
         tl = h5["trial_locked"]
         ids = tl["trial_id"][:]
         rel = tl["rel_time"][:]
-        tensor = tl[f"{signal}_baselined"][:]
+        suffix = "baselined" if baselined else "unbaselined"
+        tensor = tl[f"{signal}_{suffix}"][:]
         cells = h5["cell_specimen_id"][:]
-    feature = tensor[:, :, (rel >= FIT_START) & (rel < FIT_END)].mean(axis=2)
+    window = (rel >= start) & (rel < end)
+    if not window.any():
+        raise ValueError(f"empty feature window [{start}, {end}) for {oeid}")
+    feature = tensor[:, :, window].mean(axis=2)
     selected = labels.set_index("trial_id").reindex(ids)
     return feature, cells, selected.reset_index()
 
@@ -520,79 +525,140 @@ def _mouse_summary(rows: pd.DataFrame, value="auc", weight="miss_B") -> tuple[pd
         float(mice[value].std(ddof=1) / np.sqrt(len(mice))) if len(mice) > 1 else np.nan)
 
 
-def _choose_one_se(block: pd.DataFrame) -> float:
-    finite = block[np.isfinite(block.mouse_mean_auc)].copy()
-    if finite.empty: raise ValueError("no estimable DEV mouse AUC for this K")
-    best = finite.loc[finite.mouse_mean_auc.idxmax()]
-    allowance = float(best.mouse_se) if np.isfinite(best.mouse_se) else 0.0
-    candidates = finite[finite.mouse_mean_auc >= float(best.mouse_mean_auc) - allowance]
-    return float(candidates.C.min())  # smallest C is strongest regularization
+def _state_oof_metrics(X: np.ndarray, y: np.ndarray, raw: np.ndarray,
+                       C: float, seed: int) -> tuple[float, float, str | None]:
+    """Return held-out state AUC and natural-probability log-loss gain."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import log_loss, roc_auc_score
+    from sklearn.preprocessing import StandardScaler
+    scores = np.full(len(y), np.nan)
+    probs = np.full(len(y), np.nan)
+    null_probs = np.full(len(y), np.nan)
+    for train, test in _folds(raw):
+        if len(np.unique(y[train])) < 2:
+            return np.nan, np.nan, "temporal_support_nonestimable"
+        scaler = StandardScaler().fit(X[train])
+        model = LogisticRegression(C=C, penalty="l2", class_weight=None,
+                                   solver="liblinear", random_state=seed, max_iter=2000)
+        model.fit(scaler.transform(X[train]), y[train])
+        transformed = scaler.transform(X[test])
+        scores[test] = model.decision_function(transformed)
+        probs[test] = model.predict_proba(transformed)[:, 1]
+        prevalence = float(np.clip(y[train].mean(), 1e-6, 1 - 1e-6))
+        null_probs[test] = prevalence
+    if not (np.isfinite(scores).all() and np.isfinite(probs).all() and
+            np.isfinite(null_probs).all()):
+        return np.nan, np.nan, "state_score_incomplete"
+    return (float(roc_auc_score(y, scores)),
+            float(log_loss(y, null_probs, labels=[0, 1]) -
+                  log_loss(y, probs, labels=[0, 1])), None)
 
 
 def _state_anchor(session_cache, C50):
+    """Run the one authoritative v3.2 anchor plus prespecified diagnostics."""
     rows = []
+    specifications = (
+        ("unbaselined_pre", "anchor_pre", True, True),
+        ("unbaselined_pre", "anchor_pre", False, True),
+        ("baselined_pre", "baseline_pre", True, False),
+        ("baselined_post", "X", True, False),
+        ("unbaselined_post", "unbaselined_post", True, False),
+    )
     for item in session_cache:
-        X, lab, meta = item["X"], item["labels"], item["meta"]
-        for guarded in (True, False):
-            aucs = []
+        lab, meta = item["labels"], item["meta"]
+        for representation, feature_key, guarded, authoritative in specifications:
+            X, aucs, gains = item[feature_key], [], []
             eligible = (lab.late_hit | lab.miss) & (~lab.first_ten)
-            if guarded: eligible &= lab.keep_B
+            if guarded:
+                eligible &= lab.keep_B
             candidates = lab.loc[eligible].copy()
             group_counts = {
                 (outcome, state): int((candidates[outcome] &
                                        (candidates.engaged_B == state)).sum())
                 for outcome in ("late_hit", "miss") for state in (False, True)
             }
-            # Outcome balancing is done within state.  The smaller state total is
-            # the information-limiting class and therefore the session weight.
-            per_state = {
-                state: sum(min(group_counts[(outcome, False)],
-                               group_counts[(outcome, True)])
-                           for outcome in ("late_hit", "miss"))
-                for state in (False, True)
-            }
-            limiting_state_n = min(per_state.values())
+            balanced_per_state = sum(min(group_counts[(outcome, False)],
+                                         group_counts[(outcome, True)])
+                                     for outcome in ("late_hit", "miss"))
             for seed in range(N_SEEDS):
-                chosen = []
                 rng = np.random.default_rng(seed + int(meta["ophys_experiment_id"]))
+                chosen = []
                 for outcome in ("late_hit", "miss"):
-                    for_state = [candidates[candidates[outcome] & (candidates.engaged_B == state)].index.to_numpy()
-                                 for state in (False, True)]
-                    n = min(map(len, for_state))
+                    groups = [candidates[candidates[outcome] &
+                                         (candidates.engaged_B == state)].index.to_numpy()
+                              for state in (False, True)]
+                    n = min(map(len, groups))
                     if n:
-                        chosen.extend(rng.choice(x, n, replace=False).tolist() for x in for_state)
+                        chosen.extend(rng.choice(group, n, replace=False).tolist()
+                                      for group in groups)
                 flat = np.array([i for group in chosen for i in group], dtype=int)
-                if not len(flat): continue
+                if not len(flat):
+                    continue
                 y = lab.loc[flat, "engaged_B"].astype(int).to_numpy()
                 raw = lab.loc[flat, "trial_index"].astype(int).to_numpy()
-                subset = _subset_cells(X[flat], PRIMARY_K, seed, meta["ophys_experiment_id"])
-                if subset is None: continue
-                auc, _, err = _oof_auc(subset, y, raw, C50, seed, blocked=True)
-                if not err: aucs.append(auc)
-            rows.append({**meta, "guarded": guarded,
+                subset = _subset_cells(X[flat], PRIMARY_K, seed,
+                                       meta["ophys_experiment_id"])
+                if subset is None:
+                    continue
+                auc, gain, err = _state_oof_metrics(subset, y, raw, C50, seed)
+                if not err:
+                    aucs.append(auc); gains.append(gain)
+            rows.append({**meta, "representation": representation,
+                         "guarded": guarded, "authoritative": authoritative,
                          "auc_state": float(np.mean(aucs)) if aucs else np.nan,
-                         "limiting_state_n": int(limiting_state_n),
-                         "n_state_disengaged": int(per_state[False]),
-                         "n_state_engaged": int(per_state[True])})
+                         "state_logloss_gain": (float(np.mean(gains)) if gains else np.nan),
+                         "limiting_state_n": int(balanced_per_state),
+                         "n_state_disengaged": int(balanced_per_state),
+                         "n_state_engaged": int(balanced_per_state)})
     df = pd.DataFrame(rows)
     summaries = {}
-    for guarded, group in df.groupby("guarded"):
-        mice, mean, _ = _mouse_summary(group.rename(columns={"auc_state":"auc"}),
-                                        weight="limiting_state_n")
-        summaries["guarded" if guarded else "unguarded"] = {
-            "auc": mean, "n_mice": int(len(mice)),
-            "mouse_bca": _bca_mean(mice.auc.to_numpy() if len(mice) else np.array([]),
-                                    seed=3 if guarded else 4),
+    for name, selected in (
+        ("authoritative_guarded", df[df.authoritative & df.guarded]),
+        ("unguarded_diagnostic", df[df.authoritative & ~df.guarded]),
+    ):
+        auc_mice, auc_mean, _ = _mouse_summary(
+            selected.rename(columns={"auc_state": "auc"}), weight="limiting_state_n")
+        gain_mice, gain_mean, _ = _mouse_summary(
+            selected.rename(columns={"state_logloss_gain": "gain"}),
+            value="gain", weight="limiting_state_n")
+        summaries[name] = {
+            "auc": auc_mean, "state_logloss_gain": gain_mean,
+            "n_mice": int(len(auc_mice)),
+            "auc_mouse_bca": _bca_mean(auc_mice.auc.to_numpy()
+                                         if len(auc_mice) else np.array([]), seed=3),
+            "logloss_gain_mouse_bca": _bca_mean(gain_mice.gain.to_numpy()
+                                                  if len(gain_mice) else np.array([]), seed=4),
             "session_weight": "limiting outcome-balanced state class"}
+    diagnostics = {}
+    for (representation, guarded), group in df.groupby(["representation", "guarded"]):
+        mice, mean, _ = _mouse_summary(
+            group.rename(columns={"auc_state": "auc"}), weight="limiting_state_n")
+        diagnostics[f"{representation}_{'guarded' if guarded else 'unguarded'}"] = {
+            "auc": mean, "n_mice": int(len(mice)),
+            "authoritative": bool(group.authoritative.all() and guarded)}
+    summaries["representation_diagnostics"] = diagnostics
     return df, summaries
 
 
-def _q2_session(root: Path, item: dict, C50: float) -> tuple[float, float, str | None]:
-    """Strict outer/inner cross-fit of the generated neural score."""
+def _calibration_summary(y: np.ndarray, probabilities: np.ndarray) -> tuple[float, float]:
+    """Descriptive calibration-in-the-large and slope on pooled OOF predictions."""
+    from sklearn.linear_model import LogisticRegression
+    p = np.clip(np.asarray(probabilities, float), 1e-6, 1 - 1e-6)
+    logits = np.log(p / (1 - p)).reshape(-1, 1)
+    try:
+        model = LogisticRegression(C=1e6, penalty="l2", class_weight=None,
+                                   solver="liblinear", max_iter=2000).fit(logits, y)
+        return float(model.intercept_[0]), float(model.coef_[0, 0])
+    except Exception:
+        return np.nan, np.nan
+
+
+def _q2_session(root: Path, item: dict, C50: float) -> tuple[dict, str | None]:
+    """Strict outer/inner cross-fit under the observed outcome prevalence."""
     from sklearn.compose import ColumnTransformer
     from sklearn.impute import SimpleImputer
     from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import log_loss, roc_auc_score
+    from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -605,7 +671,7 @@ def _q2_session(root: Path, item: dict, C50: float) -> tuple[float, float, str |
             joined.q2_covariates_complete.fillna(False).astype(bool))
     use = joined.loc[mask].copy()
     if len(use) < 2 or use.late_hit.nunique() < 2:
-        return np.nan, np.nan, "q2_class_nonestimable"
+        return {}, "q2_class_nonestimable"
     Xn_all = item["X"][mask.to_numpy()]
     y = use.late_hit.astype(int).to_numpy()
     raw = use.trial_index.astype(int).to_numpy()
@@ -626,17 +692,18 @@ def _q2_session(root: Path, item: dict, C50: float) -> tuple[float, float, str |
         ])
         return Pipeline([("pre", pre),
                          ("model", LogisticRegression(C=1.0, penalty="l2",
-                                                      class_weight="balanced",
+                                                      class_weight=None,
                                                       solver="liblinear", max_iter=2000))])
 
-    deltas_loss, deltas_auc = [], []
+    seed_rows = []
     for seed in range(N_SEEDS):
         Xn = _subset_cells(Xn_all, PRIMARY_K, seed, oeid)
-        if Xn is None: return np.nan, np.nan, "low_cells"
+        if Xn is None: return {}, "low_cells"
         pred0, pred1 = np.full(len(y), np.nan), np.full(len(y), np.nan)
+        pred_neural, q1_score = np.full(len(y), np.nan), np.full(len(y), np.nan)
         for outer_train, outer_test in _folds(raw):
             if len(np.unique(y[outer_train])) < 2:
-                return np.nan, np.nan, "q2_temporal_support_nonestimable"
+                return {}, "q2_temporal_support_nonestimable"
             # Inner OOF scores for M1 training; the outer test block never enters.
             inner_scores = np.full(len(outer_train), np.nan)
             inner_raw = raw[outer_train]
@@ -644,23 +711,29 @@ def _q2_session(root: Path, item: dict, C50: float) -> tuple[float, float, str |
                 inner_train = outer_train[inner_train_local]
                 inner_test = outer_train[inner_test_local]
                 if len(np.unique(y[inner_train])) < 2:
-                    return np.nan, np.nan, "q2_inner_temporal_support_nonestimable"
+                    return {}, "q2_inner_temporal_support_nonestimable"
                 scaler = StandardScaler().fit(Xn[inner_train])
-                neural = LogisticRegression(C=C50, class_weight="balanced", solver="liblinear",
+                neural = LogisticRegression(C=C50, class_weight=None, solver="liblinear",
                                             random_state=seed, max_iter=2000)
                 neural.fit(scaler.transform(Xn[inner_train]), y[inner_train])
                 inner_scores[inner_test_local] = neural.decision_function(
                     scaler.transform(Xn[inner_test]))
             if not np.isfinite(inner_scores).all():
-                return np.nan, np.nan, "q2_inner_score_incomplete"
+                return {}, "q2_inner_score_incomplete"
             scaler = StandardScaler().fit(Xn[outer_train])
-            neural = LogisticRegression(C=C50, class_weight="balanced", solver="liblinear",
+            neural = LogisticRegression(C=C50, class_weight=None, solver="liblinear",
                                         random_state=seed, max_iter=2000)
             neural.fit(scaler.transform(Xn[outer_train]), y[outer_train])
-            test_score = neural.decision_function(scaler.transform(Xn[outer_test]))
+            transformed_test = scaler.transform(Xn[outer_test])
+            test_score = neural.decision_function(transformed_test)
+            pred_neural[outer_test] = neural.predict_proba(transformed_test)[:, 1]
+            q1 = LogisticRegression(C=C50, class_weight="balanced", solver="liblinear",
+                                    random_state=seed, max_iter=2000)
+            q1.fit(scaler.transform(Xn[outer_train]), y[outer_train])
+            q1_score[outer_test] = q1.decision_function(transformed_test)
             center, scale = float(inner_scores.mean()), float(inner_scores.std(ddof=0))
             if not np.isfinite(scale) or scale == 0:
-                return np.nan, np.nan, "q2_neural_score_zero_variance"
+                return {}, "q2_neural_score_zero_variance"
             train_frame = use.iloc[outer_train][continuous + categorical].copy()
             test_frame = use.iloc[outer_test][continuous + categorical].copy()
             train_frame["neural_score"] = (inner_scores - center) / scale
@@ -670,11 +743,75 @@ def _q2_session(root: Path, item: dict, C50: float) -> tuple[float, float, str |
             pred0[outer_test] = m0.predict_proba(test_frame)[:, 1]
             pred1[outer_test] = m1.predict_proba(test_frame)[:, 1]
         if not np.isfinite(pred0).all() or not np.isfinite(pred1).all():
-            return np.nan, np.nan, "q2_outer_score_incomplete"
-        deltas_loss.append(float(log_loss(y, pred0, labels=[0, 1]) -
-                                 log_loss(y, pred1, labels=[0, 1])))
-        deltas_auc.append(float(roc_auc_score(y, pred1) - roc_auc_score(y, pred0)))
-    return float(np.mean(deltas_loss)), float(np.mean(deltas_auc)), None
+            return {}, "q2_outer_score_incomplete"
+        if not np.isfinite(pred_neural).all() or not np.isfinite(q1_score).all():
+            return {}, "q2_neural_probability_incomplete"
+        m0_loss = float(log_loss(y, pred0, labels=[0, 1]))
+        m1_loss = float(log_loss(y, pred1, labels=[0, 1]))
+        m0_auc, m1_auc = float(roc_auc_score(y, pred0)), float(roc_auc_score(y, pred1))
+        m0_ci, m0_slope = _calibration_summary(y, pred0)
+        m1_ci, m1_slope = _calibration_summary(y, pred1)
+        seed_rows.append({
+            "n_trials": int(len(y)), "prevalence": float(y.mean()),
+            "m0_log_loss": m0_loss, "m1_log_loss": m1_loss,
+            "delta_log_loss": m0_loss - m1_loss,
+            "m0_auc": m0_auc, "m1_auc": m1_auc, "delta_auc": m1_auc - m0_auc,
+            "m0_brier": float(brier_score_loss(y, pred0)),
+            "m1_brier": float(brier_score_loss(y, pred1)),
+            "neural_only_auc": float(roc_auc_score(y, pred_neural)),
+            "neural_only_log_loss": float(log_loss(y, pred_neural, labels=[0, 1])),
+            "q1_auc_same_trials": float(roc_auc_score(y, q1_score)),
+            "m0_calibration_intercept": m0_ci, "m0_calibration_slope": m0_slope,
+            "m1_calibration_intercept": m1_ci, "m1_calibration_slope": m1_slope,
+        })
+    frame = pd.DataFrame(seed_rows)
+    metrics = {column: (int(frame[column].iloc[0]) if column == "n_trials" else
+                        float(frame[column].mean())) for column in frame.columns}
+    return metrics, None
+
+
+def _baseline_integrity(item: dict, C50: float) -> dict:
+    """Verify that trial-wise baseline subtraction removed pre-change level."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+    from sklearn.preprocessing import StandardScaler
+    lab, oeid = item["labels"], int(item["meta"]["ophys_experiment_id"])
+    mask = (lab.engaged_B.astype(bool) & lab.keep_B.astype(bool) &
+            (lab.late_hit.astype(bool) | lab.miss.astype(bool)))
+    y = lab.loc[mask, "late_hit"].astype(int).to_numpy()
+    raw = lab.loc[mask, "trial_index"].astype(int).to_numpy()
+    post, pre = item["X"][mask.to_numpy()], item["baseline_pre"][mask.to_numpy()]
+    maximum_feature_abs = float(np.max(np.abs(pre))) if pre.size else np.nan
+    seed_ranges, raw_aucs = [], []
+    for seed in range(N_SEEDS):
+        post_k = _subset_cells(post, PRIMARY_K, seed, oeid)
+        pre_k = _subset_cells(pre, PRIMARY_K, seed, oeid)
+        if post_k is None or pre_k is None:
+            return {"passed": False, "error": "low_cells"}
+        score = np.full(len(y), np.nan)
+        fold_ranges = []
+        for train, test in _folds(raw):
+            if len(np.unique(y[train])) < 2:
+                return {"passed": False, "error": "temporal_support_nonestimable"}
+            scaler = StandardScaler().fit(post_k[train])
+            model = LogisticRegression(C=C50, class_weight="balanced", solver="liblinear",
+                                       random_state=seed, max_iter=2000)
+            model.fit(scaler.transform(post_k[train]), y[train])
+            score[test] = model.decision_function(scaler.transform(pre_k[test]))
+            # Cross-validation fits a different intercept in every fold. The
+            # constructional invariant is therefore within-fold constancy, not
+            # equality of pooled scores produced by five different models.
+            fold_ranges.append(float(np.ptp(score[test])))
+        seed_ranges.append(float(max(fold_ranges)))
+        raw_aucs.append(float(roc_auc_score(y, score)))
+    max_score_range = float(max(seed_ranges))
+    numerically_constant = bool(maximum_feature_abs <= 1e-5 and max_score_range <= 1e-5)
+    return {"passed": numerically_constant,
+            "max_abs_prechange_baselined_feature": maximum_feature_abs,
+            "max_prechange_mean_dv_range": max_score_range,
+            "raw_pooled_cross_fold_auc_mean": float(np.mean(raw_aucs)),
+            "constant_score_auc": 0.5 if numerically_constant else None,
+            "feature_tolerance": 1e-5, "score_range_tolerance": 1e-5}
 
 
 def _auc_time_session(root: Path, item: dict, C50: float) -> tuple[pd.DataFrame, str | None]:
@@ -726,6 +863,31 @@ def _bca_mean(values: np.ndarray, seed=0) -> dict:
                        n_resamples=2000, random_state=np.random.default_rng(seed))
     return {"mean": float(values.mean()), "low": float(result.confidence_interval.low),
             "high": float(result.confidence_interval.high), "n_mice": int(len(values))}
+
+
+def _precision_gates(*, appendix_complete: bool, q1_mice: int, anchor_mice: int,
+                     q2_mice: int, q1_sd: float, q2_sd: float,
+                     q1_margin: float, q2_sesoi: float) -> dict:
+    try:
+        from scipy.stats import t
+        multiplier = float(t.ppf(.975, df=CONFIRM_MICE - 1))
+    except Exception:
+        multiplier = 2.048
+    q1_half_width = (float(multiplier * q1_sd / np.sqrt(CONFIRM_MICE))
+                     if np.isfinite(q1_sd) else np.nan)
+    q2_half_width = (float(multiplier * q2_sd / np.sqrt(CONFIRM_MICE))
+                     if np.isfinite(q2_sd) else np.nan)
+    coverage = bool(appendix_complete and q1_mice >= 8 and anchor_mice >= 8 and
+                    q2_mice >= 8)
+    q1_precision = bool(coverage and np.isfinite(q1_margin) and q1_margin > 0 and
+                        np.isfinite(q1_half_width) and q1_half_width < q1_margin)
+    q2_precision = bool(coverage and np.isfinite(q2_sesoi) and q2_sesoi > 0 and
+                        np.isfinite(q2_half_width) and q2_half_width < q2_sesoi)
+    return {"coverage": coverage, "q1_precision": q1_precision,
+            "q2_precision": q2_precision,
+            "confirm_ready": bool(coverage and q1_precision and q2_precision),
+            "q1_projected_half_width_29": q1_half_width,
+            "q2_projected_half_width_29": q2_half_width}
 
 
 def _weighted_random_intercept(df: pd.DataFrame, *, include_novel: bool) -> dict:
@@ -795,7 +957,9 @@ def _safe_secondary_model(df: pd.DataFrame, *, include_novel: bool) -> dict:
                 "n_sessions_input": int(len(df))}
 
 
-def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path) -> int:
+def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path,
+         *, data_release: str | None = None,
+         data_manifest_sha256: str | None = None) -> int:
     manifest = pd.read_csv(experiment_manifest)
     validate_bundles(root, manifest)
     appendix_failures = appendix_a_failures(root, manifest)
@@ -815,10 +979,20 @@ def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path) -
     cache = []
     for row in active.itertuples(index=False):
         bsid, oeid = int(row.behavior_session_id), int(row.ophys_experiment_id)
-        X, _, lab = _session_data(root, oeid, labels[labels.behavior_session_id.eq(bsid)])
+        session_labels = labels[labels.behavior_session_id.eq(bsid)]
+        X, _, lab = _session_data(root, oeid, session_labels)
+        baseline_pre, _, _ = _session_data(
+            root, oeid, session_labels, baselined=True, start=-1.0, end=0.0)
+        anchor_pre, _, _ = _session_data(
+            root, oeid, session_labels, baselined=False, start=-1.0, end=0.0)
+        unbaselined_post, _, _ = _session_data(
+            root, oeid, session_labels, baselined=False, start=FIT_START, end=FIT_END)
         ses = sessions.loc[sessions.behavior_session_id.eq(bsid)].iloc[0]
         novelty = lab.is_image_novel.dropna().astype(bool).unique()
-        cache.append({"X": X, "labels": lab, "meta": {
+        cache.append({"X": X, "baseline_pre": baseline_pre,
+                      "anchor_pre": anchor_pre,
+                      "unbaselined_post": unbaselined_post,
+                      "labels": lab, "meta": {
             "ophys_experiment_id": oeid, "behavior_session_id": bsid,
             "mouse_id": int(row.mouse_id), "project_code": row.project_code,
             "novel": (bool(novelty[0]) if len(novelty) == 1 else None),
@@ -827,55 +1001,34 @@ def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path) -
             "behavioral_eligible": bool(ses.behavioral_eligible)}})
 
     out.mkdir(parents=True, exist_ok=True)
-    tuning_rows, chosen = [], {}
-    for k in K_GRID:
-        for C in C_GRID:
-            rows = []
-            for item in cache:
-                meta = item["meta"]
-                if not meta["behavioral_eligible"]: continue
-                auc, err = _evaluate_session(item["X"], item["labels"], "engaged_B", "keep_B",
-                                             "late_hit", "miss", k, C,
-                                             meta["ophys_experiment_id"])
-                rows.append({**meta, "auc": auc, "error": err})
-            mice, mean, se = _mouse_summary(pd.DataFrame(rows))
-            tuning_rows.append({"K": str(k), "C": C, "mouse_mean_auc": mean,
-                                "mouse_se": se, "n_mice": len(mice), "n_sessions": len(rows)})
-        block = pd.DataFrame(tuning_rows)
-        block = block[block.K.eq(str(k))]
-        chosen[str(k)] = _choose_one_se(block)
-
-    curve_rows, primary_rows = [], []
-    for k in K_GRID:
-        C = chosen[str(k)]
-        for item in cache:
-            meta = item["meta"]
-            if not meta["behavioral_eligible"]: continue
-            auc, err = _evaluate_session(item["X"], item["labels"], "engaged_B", "keep_B",
-                                         "late_hit", "miss", k, C,
-                                         meta["ophys_experiment_id"])
-            row = {**meta, "K": str(k), "C": C, "auc": auc,
-                   "decoder_estimability": err or "estimable"}
-            curve_rows.append(row)
-            if k == PRIMARY_K: primary_rows.append(row)
-
-    # Frozen v3 comparator, reported without creating a second SESOI.
-    frozen_rows = []
+    primary_rows = []
     for item in cache:
         meta = item["meta"]
-        if meta["miss_A"] < 20:
-            auc, err = np.nan, "frozen_v3_miss_rule_ineligible"
-        else:
-            auc, err = _evaluate_session(item["X"], item["labels"], "engaged_A", "keep_A",
-                                         "late_hit", "miss", "all", .1,
-                                         meta["ophys_experiment_id"])
-        frozen_rows.append({**meta, "auc": auc, "decoder_estimability": err or "estimable",
-                            "frozen_v3_eligible": bool(meta["miss_A"] >= 20)})
+        if not meta["behavioral_eligible"]:
+            continue
+        auc, err = _evaluate_session(item["X"], item["labels"], "engaged_B", "keep_B",
+                                     "late_hit", "miss", PRIMARY_K, FROZEN_C50,
+                                     meta["ophys_experiment_id"])
+        primary_rows.append({**meta, "K": PRIMARY_K, "C": FROZEN_C50, "auc": auc,
+                             "decoder_estimability": err or "estimable"})
 
-    anchor_df, anchor = _state_anchor(cache, chosen[str(PRIMARY_K)])
-    guarded = anchor.get("guarded", {})
+    integrity_rows = []
+    for item in cache:
+        if item["meta"]["behavioral_eligible"]:
+            integrity_rows.append({**item["meta"],
+                                   **_baseline_integrity(item, FROZEN_C50)})
+    integrity_df = pd.DataFrame(integrity_rows)
+    integrity_df.to_parquet(out / "baseline_integrity.parquet", index=False)
+    if len(integrity_df) and not bool(integrity_df.passed.all()):
+        failed = integrity_df.loc[~integrity_df.passed, "ophys_experiment_id"].tolist()
+        raise ValueError(f"baseline-subtraction integrity failed for {failed}")
+
+    anchor_df, anchor = _state_anchor(cache, FROZEN_C50)
+    guarded = anchor.get("authoritative_guarded", {})
     auc_state = float(guarded.get("auc", np.nan))
-    sesoi_margin = .2 * (auc_state - .5) if np.isfinite(auc_state) else np.nan
+    state_logloss_gain = float(guarded.get("state_logloss_gain", np.nan))
+    q1_sesoi_margin = .2 * (auc_state - .5) if np.isfinite(auc_state) else np.nan
+    q2_sesoi = .2 * state_logloss_gain if np.isfinite(state_logloss_gain) else np.nan
     primary_df = pd.DataFrame(primary_rows)
     mouse_q1, _, _ = _mouse_summary(primary_df)
 
@@ -890,7 +1043,7 @@ def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path) -
             continue
         auc, err = _evaluate_session(
             item["X"], item["labels"], "engaged_B", "keep_B", "late_hit", "miss",
-            PRIMARY_K, chosen[str(PRIMARY_K)], meta["ophys_experiment_id"])
+            PRIMARY_K, FROZEN_C50, meta["ophys_experiment_id"])
         threshold_base.append({**meta, "auc": auc,
                                "decoder_estimability": err or "estimable"})
     threshold_base = pd.DataFrame(threshold_base)
@@ -908,39 +1061,29 @@ def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path) -
                                   "n_estimable_sessions": int(np.isfinite(selected.auc).sum()),
                                   "n_mice": int(len(mice)), "mouse_mean_auc": mean,
                                   "ci_low": interval["low"], "ci_high": interval["high"]})
-    s50 = float(mouse_q1.auc.std(ddof=1)) if len(mouse_q1) > 1 else np.nan
-    try:
-        from scipy.stats import t
-        half_width = float(t.ppf(.975, df=CONFIRM_MICE-1) * s50 / np.sqrt(CONFIRM_MICE))
-    except Exception:
-        half_width = float(2.048 * s50 / np.sqrt(CONFIRM_MICE))
-    gate1 = bool(not appendix_failures and len(mouse_q1) >= 8 and
-                 guarded.get("n_mice", 0) >= 8 and np.isfinite(auc_state))
-    gate2 = bool(gate1 and np.isfinite(half_width) and half_width < sesoi_margin)
-
     sensitivity_rows, q2_rows, time_rows = [], [], []
     for item in cache:
         meta = item["meta"]
         if not meta["behavioral_eligible"]: continue
         random_auc, random_err = _evaluate_session(
             item["X"], item["labels"], "engaged_B", "keep_B", "late_hit", "miss",
-            PRIMARY_K, chosen[str(PRIMARY_K)], meta["ophys_experiment_id"], blocked=False)
+            PRIMARY_K, FROZEN_C50, meta["ophys_experiment_id"], blocked=False)
         dff_X, _, dff_lab = _session_data(
             root, meta["ophys_experiment_id"],
             labels[labels.behavior_session_id.eq(meta["behavior_session_id"])], signal="dff")
         dff_auc, dff_err = _evaluate_session(
             dff_X, dff_lab, "engaged_B", "keep_B", "late_hit", "miss", PRIMARY_K,
-            chosen[str(PRIMARY_K)], meta["ophys_experiment_id"], blocked=True)
+            FROZEN_C50, meta["ophys_experiment_id"], blocked=True)
         sensitivity_rows.extend([
             {**meta, "analysis": "events_random_cv", "auc": random_auc,
              "decoder_estimability": random_err or "estimable"},
             {**meta, "analysis": "dff_blocked_cv", "auc": dff_auc,
              "decoder_estimability": dff_err or "estimable"},
         ])
-        delta_loss, delta_auc, q2err = _q2_session(root, item, chosen[str(PRIMARY_K)])
-        q2_rows.append({**meta, "delta_log_loss": delta_loss, "delta_auc": delta_auc,
+        q2_metrics, q2err = _q2_session(root, item, FROZEN_C50)
+        q2_rows.append({**meta, **q2_metrics,
                         "q2_estimability": q2err or "estimable"})
-        time_df, time_err = _auc_time_session(root, item, chosen[str(PRIMARY_K)])
+        time_df, time_err = _auc_time_session(root, item, FROZEN_C50)
         if time_err:
             sensitivity_rows.append({**meta, "analysis": "fixed_axis_auc_time",
                                      "auc": np.nan, "decoder_estimability": time_err})
@@ -951,38 +1094,34 @@ def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path) -
 
     q2_df = pd.DataFrame(q2_rows)
     q2_mouse_rows = []
-    for mouse, group in q2_df[np.isfinite(q2_df.delta_log_loss)].groupby("mouse_id"):
+    q2_valid = q2_df[q2_df.get("delta_log_loss", pd.Series(index=q2_df.index,
+                                                            dtype=float)).notna()]
+    q2_metric_columns = [column for column in q2_df.columns
+                         if column in {"prevalence", "m0_log_loss", "m1_log_loss",
+                                       "delta_log_loss", "m0_auc", "m1_auc", "delta_auc",
+                                       "m0_brier", "m1_brier", "neural_only_auc",
+                                       "neural_only_log_loss", "q1_auc_same_trials",
+                                       "m0_calibration_intercept", "m0_calibration_slope",
+                                       "m1_calibration_intercept", "m1_calibration_slope"}]
+    for mouse, group in q2_valid.groupby("mouse_id"):
         weights = np.maximum(group.miss_B.to_numpy(float), 1)
-        q2_mouse_rows.append({"mouse_id": mouse,
-            "delta_log_loss": float(np.average(group.delta_log_loss, weights=weights)),
-            "delta_auc": float(np.average(group.delta_auc, weights=weights))})
+        row = {"mouse_id": mouse}
+        for column in q2_metric_columns:
+            finite = np.isfinite(group[column].to_numpy(float))
+            row[column] = (float(np.average(group.loc[finite, column], weights=weights[finite]))
+                           if finite.any() else np.nan)
+        q2_mouse_rows.append(row)
     q2_mice = pd.DataFrame(q2_mouse_rows)
 
-    curve_df = pd.DataFrame(curve_rows)
-    curve_summary = []
-    for k, group in curve_df.groupby("K", sort=False):
-        mice, mean, _ = _mouse_summary(group)
-        interval = _bca_mean(mice.auc.to_numpy() if len(mice) else np.array([]),
-                             seed=200 + len(curve_summary))
-        estimable = group[np.isfinite(group.auc)]
-        curve_summary.append({
-            "K": str(k), "C": float(group.C.iloc[0]), "mouse_mean_auc": mean,
-            "between_mouse_sd": (float(mice.auc.std(ddof=1)) if len(mice) > 1 else np.nan),
-            "ci_low": interval["low"], "ci_high": interval["high"],
-            "n_sessions": int(len(estimable)), "n_mice": int(len(mice)),
-            "n_temporal_support_failures": int(group.decoder_estimability.astype(str)
-                                                  .str.contains("temporal_support").sum()),
-            "support_behavior_sessions": ",".join(map(str, sorted(
-                estimable.behavior_session_id.astype(int).unique()))),
-            "support_mice": ",".join(map(str, sorted(estimable.mouse_id.astype(int).unique()))),
-        })
-    curve_summary_df = pd.DataFrame(curve_summary)
+    q1_sd = float(mouse_q1.auc.std(ddof=1)) if len(mouse_q1) > 1 else np.nan
+    q2_sd = (float(q2_mice["delta_log_loss"].std(ddof=1))
+             if len(q2_mice) > 1 and "delta_log_loss" in q2_mice else np.nan)
+    gates = _precision_gates(
+        appendix_complete=not appendix_failures, q1_mice=len(mouse_q1),
+        anchor_mice=int(guarded.get("n_mice", 0)), q2_mice=len(q2_mice),
+        q1_sd=q1_sd, q2_sd=q2_sd, q1_margin=q1_sesoi_margin, q2_sesoi=q2_sesoi)
 
-    pd.DataFrame(tuning_rows).to_parquet(out / "c_tuning.parquet", index=False)
-    curve_df.to_parquet(out / "learning_curve.parquet", index=False)
-    curve_summary_df.to_parquet(out / "learning_curve_summary.parquet", index=False)
     primary_df.to_parquet(out / "q1_sessions.parquet", index=False)
-    pd.DataFrame(frozen_rows).to_parquet(out / "q1_frozen_v3.parquet", index=False)
     anchor_df.to_parquet(out / "auc_state.parquet", index=False)
     mouse_q1.to_parquet(out / "q1_mice.parquet", index=False)
     pd.DataFrame(sensitivity_rows).to_parquet(out / "q1_sensitivity.parquet", index=False)
@@ -995,34 +1134,56 @@ def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path) -
     q2_df.to_parquet(out / "q2_sessions.parquet", index=False)
     q2_mice.to_parquet(out / "q2_mice.parquet", index=False)
     result = {
-        "schema": "neural-dev-v3.1", "n_expected_experiments": 70,
-        "n_active": 50, "n_passive": 20, "per_k_C": chosen,
+        "schema": "neural-dev-v3.2", "n_expected_experiments": 70,
+        "n_active": 50, "n_passive": 20,
+        "data_source": {"analysis_only": True, "reused_extracted_bundles": True,
+                        "allen_nwb_download": False,
+                        "neural_data_release": data_release,
+                        "data_manifest_sha256": data_manifest_sha256},
         "appendix_a": {"complete": not appendix_failures,
                        "failures": appendix_failures},
-        "primary": {"K": PRIMARY_K, "C": chosen[str(PRIMARY_K)],
+        "primary": {"K": PRIMARY_K, "C": FROZEN_C50,
                     "signal": "events", "target": "late-hit-vs-miss"},
+        "k_policy": {"authoritative_K": 50, "other_K_computed": False,
+                     "reason": "cell-count heterogeneity"},
+        "c_policy": {"C50": FROZEN_C50, "source": "frozen v3.1 one-SE result",
+                     "retuned": False},
+        "v3_1_comparator": {"recomputed": False, "status": "immutable external reference"},
         "selection_sweep": {"miss_thresholds": [10, 15, 20, 25, 30],
                             "late_hit_min": 20,
                             "C_and_decoder_frozen": True},
-        "sesoi": {"authoritative": "guarded", "guarded": anchor.get("guarded"),
-                  "unguarded_diagnostic": anchor.get("unguarded"),
-                  "q1": (.5 + sesoi_margin if np.isfinite(sesoi_margin) else None),
-                  "q2_delta_auc": (sesoi_margin if np.isfinite(sesoi_margin) else None)},
-        "section11": {"between_mouse_sd_k50": s50, "projected_half_width_29": half_width,
-                      "sesoi_margin": sesoi_margin, "gate1": gate1, "gate2": gate2,
-                      "confirm_ready": gate1 and gate2,
-                      "learning_curve": curve_summary},
+        "anchor": {"authoritative": "unbaselined_pre_guarded",
+                   "authoritative_guarded": guarded,
+                   "unguarded_diagnostic": anchor.get("unguarded_diagnostic"),
+                   "representation_diagnostics": anchor.get("representation_diagnostics"),
+                   "other_representations_diagnostic_only": True},
+        "sesoi": {"q1_auc_boundary": (.5 + q1_sesoi_margin
+                                          if np.isfinite(q1_sesoi_margin) else None),
+                  "q1_margin": (q1_sesoi_margin if np.isfinite(q1_sesoi_margin) else None),
+                  "q2_delta_logloss": (q2_sesoi if np.isfinite(q2_sesoi) else None)},
+        "gates": {**gates,
+                  "q1_between_mouse_sd": q1_sd,
+                  "q2_between_mouse_sd": q2_sd,
+                  "required_mice": 8},
         "q1_mouse_bca": _bca_mean(mouse_q1.auc.to_numpy() if len(mouse_q1) else np.array([])),
-        "q2": {"delta_log_loss": _bca_mean(q2_mice.delta_log_loss.to_numpy()
-                                              if len(q2_mice) else np.array([]), seed=1),
-               "delta_auc": _bca_mean(q2_mice.delta_auc.to_numpy()
-                                       if len(q2_mice) else np.array([]), seed=2)},
+        "q2": {"delta_log_loss": _bca_mean(
+                   q2_mice["delta_log_loss"].to_numpy()
+                   if len(q2_mice) and "delta_log_loss" in q2_mice else np.array([]), seed=1),
+               "delta_auc": _bca_mean(
+                   q2_mice["delta_auc"].to_numpy()
+                   if len(q2_mice) and "delta_auc" in q2_mice else np.array([]), seed=2),
+               "mouse_equal_means": {
+                   column: float(q2_mice[column].mean()) for column in q2_metric_columns
+                   if len(q2_mice) and column in q2_mice}},
         "q2_nuisance_model": {"regularization": "L2", "C": 1.0,
-                              "selection": "fixed; not tuned on outcomes"},
+                              "class_weight": None, "natural_prevalence": True,
+                              "selection": "fixed; not tuned on outcomes",
+                              "neural_score_class_weight": None},
+        "integrity": {"baseline_subtraction_all_passed":
+                      bool(integrity_df.passed.all()) if len(integrity_df) else False,
+                      "n_sessions": int(len(integrity_df))},
         "secondary_models": {
-            "v3.1_project_only": _safe_secondary_model(primary_df, include_novel=False),
-            "frozen_v3_project_plus_novel": _safe_secondary_model(
-                pd.DataFrame(frozen_rows), include_novel=True),
+            "v3.2_project_only": _safe_secondary_model(primary_df, include_novel=False),
         },
     }
     (out / "analysis-manifest.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -1048,9 +1209,14 @@ def main() -> int:
     s.add_argument("--neural", type=Path, required=True)
     s.add_argument("--behavior", type=Path, required=True)
     s.add_argument("--out", type=Path, required=True)
+    s.add_argument("--data-release")
+    s.add_argument("--data-manifest-sha256")
     args = ap.parse_args()
     if args.cmd == "manifest": return make_manifest(args.ids_from, args.out, args.cache)
-    if args.cmd == "scan": return scan(args.neural, args.manifest, args.behavior, args.out)
+    if args.cmd == "scan":
+        return scan(args.neural, args.manifest, args.behavior, args.out,
+                    data_release=args.data_release,
+                    data_manifest_sha256=args.data_manifest_sha256)
     manifest = pd.read_csv(args.manifest)
     k, n = parse_shard(args.shard)
     containers = sorted(manifest.ophys_container_id.astype(int).unique())
