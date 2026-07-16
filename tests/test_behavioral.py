@@ -119,6 +119,33 @@ class BehavioralTests(unittest.TestCase):
             self.assertTrue(behavioral.bundle_complete(out, 123))
             self.assertFalse((out / ".staging").exists())
 
+    def test_pull_does_not_retry_deterministic_decode_error(self):
+        target = (
+            "allensdk.brain_observatory.behavior.behavior_project_cache."
+            "VisualBehaviorOphysProjectCache.from_s3_cache"
+        )
+        calls = {"count": 0}
+
+        class BrokenCache:
+            def get_behavior_session(self, _):
+                calls["count"] += 1
+                raise TypeError("incompatible NWB schema")
+
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch(target, return_value=BrokenCache()), \
+                mock.patch.object(behavioral.time, "sleep"), \
+                redirect_stdout(output):
+            root = Path(tmp)
+            out = root / "bundles"
+            self.assertEqual(behavioral.pull(
+                [123], out, root / "cache", retries=3,
+                report_name="_pull_01-of-01.json"), 1)
+            report = json.loads((out / "_pull_01-of-01.json").read_text())
+            self.assertEqual(calls["count"], 1)
+            self.assertEqual(report["failed"][0]["attempts"], 1)
+            self.assertIn("TypeError: incompatible NWB schema", output.getvalue())
+
     def test_validate_rejects_incomplete_and_mismatched_sets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -76,6 +76,14 @@ def parse_shard(value: str) -> tuple[int, int]:
     return k, n
 
 
+def retryable_error(exc: Exception) -> bool:
+    """Retry transport/checksum failures, not deterministic decode/data bugs."""
+    module = type(exc).__module__
+    if isinstance(exc, (TypeError, ValueError, KeyError, AssertionError)):
+        return False
+    return not module.startswith(("hdmf", "pynwb", "pyarrow", "pandas"))
+
+
 # ═══════════════════════════════════════════════════════════════════ stage 1 ══
 def pull(ids: list[int], out: Path, cache_dir: Path, *, retries: int = 3,
          report_name: str = "_pull.json") -> int:
@@ -110,12 +118,16 @@ def pull(ids: list[int], out: Path, cache_dir: Path, *, retries: int = 3,
 
         t0 = time.time()
         last_error = None
+        attempts_used = 0
         for attempt in range(1, retries + 1):
+            attempts_used = attempt
             cd = cache_dir / f"{bsid}-attempt-{attempt}"
             stage = staging_root / str(bsid)
             shutil.rmtree(stage, ignore_errors=True)
             stage.mkdir(parents=True)
             try:
+                print(f"[{i}/{len(ids)}] {bsid}  attempt {attempt}/{retries} starting",
+                      flush=True)
                 cache = VisualBehaviorOphysProjectCache.from_s3_cache(cache_dir=cd)
                 bs = cache.get_behavior_session(bsid)
 
@@ -153,21 +165,25 @@ def pull(ids: list[int], out: Path, cache_dir: Path, *, retries: int = 3,
                       f"{mb:6.3f} MB  {time.time()-t0:5.1f}s", flush=True)
                 last_error = None
                 break
-            except Exception:
+            except Exception as exc:
                 last_error = traceback.format_exc(limit=5)
                 for path in bundle_paths(out, bsid):
                     path.unlink(missing_ok=True)
-                print(f"[{i}/{len(ids)}] {bsid}  attempt {attempt}/{retries} FAILED",
-                      flush=True)
-                if attempt < retries:
-                    time.sleep(5 * (2 ** (attempt - 1)))
+                will_retry = retryable_error(exc) and attempt < retries
+                action = "retrying" if will_retry else "not retrying"
+                print(f"[{i}/{len(ids)}] {bsid}  attempt {attempt}/{retries} FAILED; "
+                      f"{action}", flush=True)
+                if not will_retry:
+                    print(last_error, flush=True)
+                    break
+                time.sleep(5 * (2 ** (attempt - 1)))
             finally:
                 shutil.rmtree(cd, ignore_errors=True)      # <- the whole disk story
                 shutil.rmtree(stage, ignore_errors=True)
 
         if last_error is not None:
             failed.append(dict(behavior_session_id=int(bsid), err=last_error,
-                               attempts=retries))
+                               attempts=attempts_used))
 
     shutil.rmtree(staging_root, ignore_errors=True)
     report = dict(ok=ok, skipped=[int(x) for x in skipped], failed=failed,

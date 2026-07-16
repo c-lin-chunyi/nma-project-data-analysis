@@ -32,7 +32,6 @@ jobs:
     outputs:
       split-tag: ${{ steps.release.outputs.tag }}
       split-url: ${{ steps.release.outputs.url }}
-      split-commit: ${{ steps.release.outputs.commit }}
     steps:
       - name: Resolve and download frozen split Release
         id: release
@@ -63,18 +62,16 @@ jobs:
           test -s ../split/dev_mice.csv
 
           url="$(gh release view "$tag" --json url --jq .url)"
-          commit="$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)"
           {
             echo "tag=$tag"
             echo "url=$url"
-            echo "commit=$commit"
           } >> "$GITHUB_OUTPUT"
       - name: Pass verified split to workers
         uses: actions/upload-artifact@v7
         with:
           name: behavioral-split-input
           path: run/
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: error
           overwrite: true
 
@@ -89,7 +86,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.resolve-split.outputs.split-tag }}
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -106,6 +103,7 @@ jobs:
         id: pull
         continue-on-error: true
         run: |
+          set -o pipefail
           mkdir -p run/bundles
           python pipeline/verify-behavioral/behavioral.py pull \
             --ids-from run/split/dev_mice.csv \
@@ -119,7 +117,7 @@ jobs:
         with:
           name: dev-bundle-${{ matrix.shard }}
           path: run/bundles/
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: error
           overwrite: true
       - name: Propagate pull failure after upload
@@ -133,7 +131,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.resolve-split.outputs.split-tag }}
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -153,19 +151,26 @@ jobs:
           path: run/bundles
           merge-multiple: true
       - name: Validate complete dev set and scan
+        id: scan
+        continue-on-error: true
         run: |
+          set -o pipefail
           python pipeline/verify-behavioral/behavioral.py scan run/bundles \
             --ids-from run/split/dev_mice.csv --sweep \
             2>&1 | tee run/bundles/scan.log
           python -m pip freeze > run/behavioral-environment.txt
       - name: Upload complete behavioral result
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: behavioral-result
           path: run/
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: error
           overwrite: true
+      - name: Propagate scan failure after upload
+        if: steps.scan.outcome != 'success'
+        run: exit 1
 
   publish-release:
     needs: [resolve-split, scan-dev]
@@ -215,7 +220,7 @@ jobs:
           - Frozen split: [{os.environ['SPLIT_TAG']}]({os.environ['SPLIT_URL']})
           - Split DEV checksum: `{manifest['dev_checksum']}`
           - Expected DEV sessions: {n_dev_sessions}
-          - Behavioral code commit: `{manifest['provenance']['analysis_commit']}`
+          - Behavioral code commit: `{os.environ['GITHUB_SHA']}`
           - Workflow run: {run_url}
 
           The scan used only the DEV session IDs from the frozen split Release.
@@ -228,14 +233,13 @@ jobs:
       - name: Publish behavioral Release
         env:
           GH_TOKEN: ${{ github.token }}
-          SPLIT_COMMIT: ${{ needs.resolve-split.outputs.split-commit }}
         run: |
           tag="behavioral-${GITHUB_RUN_ID}"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists; keeping the published assets unchanged."
           else
             gh release create "$tag" assets/* \
-              --target "$SPLIT_COMMIT" \
+              --target "$GITHUB_SHA" \
               --title "$tag: DEV behavioral scan" \
               --notes-file release-notes.md \
               --latest=false

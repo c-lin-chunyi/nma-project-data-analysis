@@ -78,6 +78,7 @@ jobs:
         run: python -m pip install -r requirements-pipeline.txt
       - name: Draw and strictly verify split
         run: |
+          set -o pipefail
           mkdir -p run/split
           python pipeline/draw/split.py build --out run/split \
             2>&1 | tee run/split/build.log
@@ -146,6 +147,6 @@ jobs:
           path: |
             run/split/
             assets/
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: warn
           overwrite: true
