@@ -1,0 +1,115 @@
+name: behavioral v3.1 rescan
+
+run-name: behavioral v3.1 · ${{ inputs.behavioral_release }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      behavioral_release:
+        description: 'Existing behavioral-* Release tag containing the 50 DEV bundles'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: behavioral-v3.1-${{ inputs.behavioral_release }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  rescan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pinned pipeline
+        run: python -m pip install -r requirements-pipeline.txt
+      - name: Download and verify source behavioral Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          case "$SOURCE_TAG" in behavioral-*) ;; *) echo "::error::expected behavioral-* tag"; exit 1;; esac
+          mkdir -p run/source run/bundles run/split
+          gh release download "$SOURCE_TAG" --dir run/source
+          cd run/source
+          sha256sum --check SHA256SUMS
+          tar -xzf dev-bundles.tar.gz -C ../bundles
+          tar -xzf source-split.tar.gz -C ..
+          test -s ../split/dev_mice.csv
+      - name: Run v3.1 behavioral scan without downloading data
+        run: |
+          set -o pipefail
+          python pipeline/verify-behavioral/behavioral.py scan run/bundles \
+            --ids-from run/split/dev_mice.csv --sweep 2>&1 | tee run/bundles/scan-v3.1.log
+          python -m pip freeze > run/behavioral-v3.1-environment.txt
+          sha256sum requirements-pipeline.txt > run/environment-input.sha256
+          python - <<'PY'
+          import datetime, hashlib, json, os, platform
+          from pathlib import Path
+          env=Path('run/behavioral-v3.1-environment.txt').read_bytes()
+          data={'date_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'code_commit':os.environ['GITHUB_SHA'],'python':platform.python_version(),
+                'runner_os':os.environ.get('ImageOS',os.environ.get('RUNNER_OS')),
+                'runner_image_version':os.environ.get('ImageVersion'),
+                'pip_freeze_sha256':hashlib.sha256(env).hexdigest()}
+          Path('run/provenance.json').write_text(json.dumps(data,indent=2)+'\n')
+          PY
+      - name: Package immutable v3.1 Release
+        env:
+          SOURCE_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          mkdir -p assets scan
+          cp run/bundles/_*.parquet scan/
+          cp run/bundles/_*.json scan/ 2>/dev/null || true
+          cp run/bundles/behavioral-manifest.json run/bundles/scan-v3.1.log scan/
+          cp prereg_v3.1.md scan/
+          tar -czf assets/behavioral-v3.1-scan.tar.gz -C scan .
+          cp run/source/dev-bundles.tar.gz assets/dev-bundles.tar.gz
+          cp run/source/source-split.tar.gz assets/source-split.tar.gz
+          cp run/behavioral-v3.1-environment.txt run/environment-input.sha256 run/provenance.json assets/
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          p=Path('scan/behavioral-manifest.json')
+          d=json.loads(p.read_text())
+          d.update(source_behavioral_release=os.environ['SOURCE_TAG'], code_commit=os.environ['GITHUB_SHA'],
+                   workflow_run=f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
+          p.write_text(json.dumps(d, indent=2)+'\n')
+          Path('assets/behavioral-manifest.json').write_text(p.read_text())
+          PY
+          tar -czf assets/behavioral-v3.1-scan.tar.gz -C scan .
+          cd assets
+          sha256sum behavioral-v3.1-scan.tar.gz dev-bundles.tar.gz source-split.tar.gz \
+            behavioral-v3.1-environment.txt environment-input.sha256 behavioral-manifest.json > SHA256SUMS
+          sha256sum provenance.json >> SHA256SUMS
+      - name: Upload diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: behavioral-v3.1-result
+          path: run/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Publish behavioral v3.1 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          tag="behavioral-v3.1-${GITHUB_RUN_ID}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          printf '# Behavioral v3.1 DEV rescan\n\n- Source: `%s`\n- Code: `%s`\n- Run: %s\n\nNo NWB or CONFIRM data was downloaded. The authoritative contrast is late hit vs miss.\n' \
+            "$SOURCE_TAG" "$GITHUB_SHA" "$run_url" > release-notes.md
+          gh release create "$tag" assets/* --target "$GITHUB_SHA" \
+            --title "$tag: DEV behavioral v3.1" --notes-file release-notes.md --latest=false

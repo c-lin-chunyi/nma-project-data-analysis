@@ -170,9 +170,31 @@ class BehavioralTests(unittest.TestCase):
                 self.assertEqual(behavioral.scan(root, True, ids), 0)
             self.assertTrue((root / "_scan.parquet").is_file())
             sweep = pd.read_parquet(root / "_sweep.parquet")
-            self.assertEqual(len(sweep), 36)
-            self.assertIn("qualifying_sessions_A", sweep.columns)
-            self.assertIn("qualifying_mice_B", sweep.columns)
+            self.assertEqual(len(sweep), 10)
+            self.assertEqual(set(sweep.miss_threshold), {10, 15, 20, 25, 30})
+            self.assertTrue((root / "_trial_labels.parquet").is_file())
+            self.assertTrue((root / "_eligibility.parquet").is_file())
+            manifest = json.loads((root / "behavioral-manifest.json").read_text())
+            self.assertEqual(manifest["primary"], "B-engaged late-hit-vs-miss")
+
+    def test_late_hit_and_poisson_hysteresis_are_explicit(self):
+        n = 40
+        tr = pd.DataFrame({
+            "start_time": np.arange(n, dtype=float),
+            "stop_time": np.arange(n, dtype=float) + .8,
+            "hit": np.arange(n) % 2 == 0,
+            "miss": np.arange(n) % 2 == 1,
+            "aborted": False,
+            "response_latency": np.where(np.arange(n) % 4 == 0, .2,
+                                         np.where(np.arange(n) % 2 == 0, .45, np.inf)),
+        })
+        sp = pd.DataFrame({"is_image_novel": [True]})
+        labels, session, guard = behavioral.label_session(
+            tr, sp, np.arange(0, n, 2.0), np.arange(1, n, 4.0))
+        self.assertEqual(int(labels.early_hit.sum()), 10)
+        self.assertEqual(int(labels.late_hit.sum()), 10)
+        self.assertIn("late_hit_A_hysteretic", session)
+        self.assertIn("guard_loss_A_hysteretic", guard)
 
     def test_scan_rejects_empty_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

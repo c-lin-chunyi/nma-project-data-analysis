@@ -1,0 +1,287 @@
+name: neural DEV v3.1 from behavioral Release
+
+run-name: neural DEV · ${{ inputs.behavioral_release }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      behavioral_release:
+        description: 'Exact behavioral-v3.1-* Release tag'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: neural-dev-${{ inputs.behavioral_release }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  SHARD_COUNT: '10'
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pinned pipeline
+        run: python -m pip install -r requirements-pipeline.txt
+      - name: Resolve verified behavioral v3.1 source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          case "$BEHAVIOR_TAG" in behavioral-v3.1-*) ;; *) echo "::error::exact behavioral-v3.1 tag required"; exit 1;; esac
+          mkdir -p run/source run/behavior run/split
+          gh release download "$BEHAVIOR_TAG" --dir run/source
+          cd run/source
+          sha256sum --check SHA256SUMS
+          tar -xzf dev-bundles.tar.gz -C ../behavior
+          tar -xzf behavioral-v3.1-scan.tar.gz -C ../behavior
+          tar -xzf source-split.tar.gz -C ..
+          test -s ../behavior/behavioral-manifest.json
+          test -s ../split/dev_mice.csv
+      - name: Derive exact 70-experiment Appendix-A manifest
+        run: |
+          python pipeline/verify-neural/neural.py manifest \
+            --ids-from run/split/dev_mice.csv \
+            --out run/dev_experiments.csv --cache "$RUNNER_TEMP/allen-meta"
+          test "$(($(wc -l < run/dev_experiments.csv)-1))" -eq 70
+      - name: Upload verified inputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: neural-dev-input
+          path: run/
+          retention-days: 14
+          if-no-files-found: error
+
+  pull:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pinned pipeline
+        run: python -m pip install -r requirements-pipeline.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-dev-input
+          path: run
+      - name: Pull one DEV container shard
+        id: pull
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p run/neural
+          python pipeline/verify-neural/neural.py pull \
+            --manifest run/dev_experiments.csv \
+            --shard '${{ matrix.shard }}/${{ env.SHARD_COUNT }}' \
+            --out run/neural --cache "$RUNNER_TEMP/allen-neural" --retries 3 \
+            2>&1 | tee "run/neural/pull-${{ matrix.shard }}.log"
+      - name: Upload shard even after failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: neural-container-${{ matrix.shard }}
+          path: run/neural/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Propagate pull failure
+        if: steps.pull.outcome != 'success'
+        run: exit 1
+
+  analyze:
+    needs: [resolve, pull]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pinned pipeline
+        run: python -m pip install -r requirements-pipeline.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-dev-input
+          path: run
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: neural-container-*
+          path: run/neural
+          merge-multiple: true
+      - name: Run Q1 Q2 SESOI and gates
+        run: |
+          set -o pipefail
+          mkdir -p run/analysis
+          python pipeline/verify-neural/neural.py scan \
+            --manifest run/dev_experiments.csv --neural run/neural \
+            --behavior run/behavior --out run/analysis \
+            2>&1 | tee run/analysis/analysis.log
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          result=json.loads(Path('run/analysis/analysis-manifest.json').read_text())
+          text=Path('prereg_v3.1.md').read_text().rstrip()
+          lines=['','## DEV-frozen values (authoritative Release snapshot)','',
+                 '| K | Frozen C_K |','|---:|---:|']
+          lines += [f'| {k} | {v:.8g} |' for k,v in result['per_k_C'].items()]
+          g=result['sesoi']['guarded'] or {}
+          lines += ['','Only the guarded anchor below is authoritative:', '',
+                    f"- `AUC_state_guarded = {g.get('auc')}`",
+                    f"- `SESOI_Q1 = {result['sesoi']['q1']}`",
+                    f"- `SESOI_Q2 = {result['sesoi']['q2_delta_auc']}`",
+                    f"- `confirm_ready = {result['section11']['confirm_ready']}`"]
+          Path('run/analysis/prereg_v3.1-frozen.md').write_text(text+'\n'+'\n'.join(lines)+'\n')
+          PY
+          python -m pip freeze > run/neural-v3.1-environment.txt
+          sha256sum requirements-pipeline.txt > run/environment-input.sha256
+          python - <<'PY'
+          import datetime, hashlib, json, os, platform
+          from pathlib import Path
+          env=Path('run/neural-v3.1-environment.txt').read_bytes()
+          data={'date_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'code_commit':os.environ['GITHUB_SHA'],'python':platform.python_version(),
+                'runner_os':os.environ.get('ImageOS',os.environ.get('RUNNER_OS')),
+                'runner_image_version':os.environ.get('ImageVersion'),
+                'pip_freeze_sha256':hashlib.sha256(env).hexdigest()}
+          Path('run/provenance.json').write_text(json.dumps(data,indent=2)+'\n')
+          PY
+      - name: Upload complete diagnostic result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: neural-dev-result
+          path: |
+            run/analysis/
+            run/dev_experiments.csv
+            run/neural-v3.1-environment.txt
+            run/environment-input.sha256
+            run/provenance.json
+            run/behavior/behavioral-manifest.json
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    needs: analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-dev-result
+          path: run
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: neural-container-*
+          path: run/neural
+          merge-multiple: true
+      - name: Stream container shards into immutable DEV neural Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          tag="neural-dev-${GITHUB_RUN_ID}"
+          mkdir -p assets
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          analysis=json.loads(Path('run/analysis/analysis-manifest.json').read_text())
+          manifest={'schema':'neural-dev-release-v3.1','behavioral_release':os.environ['BEHAVIOR_TAG'],
+                    'code_commit':os.environ['GITHUB_SHA'],'n_experiments':70,
+                    'confirm_ready':analysis['section11']['confirm_ready'],
+                    'analysis_manifest':analysis,
+                    'workflow_run':f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
+          Path('assets/neural-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          PY
+          ready=$(python -c 'import json; print(str(json.load(open("assets/neural-manifest.json"))["confirm_ready"]).lower())')
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          printf '# Neural DEV v3.1\n\n- Behavioral source: `%s`\n- Code: `%s`\n- Run: %s\n- `confirm_ready`: **%s**\n\nThis Release contains DEV only. A false gate is a diagnostic result and does not authorize a CONFIRM run.\n' \
+            "$BEHAVIOR_TAG" "$GITHUB_SHA" "$run_url" "$ready" > release-notes.md
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$tag: DEV neural v3.1" \
+              --notes-file release-notes.md --latest=false --draft
+          fi
+          : > assets/SHA256SUMS
+          python - <<'PY'
+          import tarfile
+          from pathlib import Path
+          with tarfile.open('assets/neural-v3.1-analysis.tar.gz','w:gz') as tar:
+              for p in sorted(Path('run/analysis').iterdir()): tar.add(p,arcname=p.name)
+          PY
+          cp run/analysis/prereg_v3.1-frozen.md run/neural-v3.1-environment.txt run/environment-input.sha256 \
+            run/provenance.json assets/
+          mv assets/prereg_v3.1-frozen.md assets/prereg_v3.1.md
+          cp run/analysis/analysis-manifest.json run/behavior/behavioral-manifest.json \
+            run/dev_experiments.csv assets/
+          for f in assets/neural-v3.1-analysis.tar.gz assets/neural-manifest.json \
+                   assets/prereg_v3.1.md assets/neural-v3.1-environment.txt \
+                   assets/environment-input.sha256 assets/provenance.json \
+                   assets/analysis-manifest.json assets/behavioral-manifest.json \
+                   assets/dev_experiments.csv; do
+            sha256sum "$f" | sed 's#assets/##' >> assets/SHA256SUMS
+            gh release upload "$tag" "$f" --clobber
+          done
+          containers=$(python -c 'import csv; print(" ".join(sorted({r["ophys_container_id"] for r in csv.DictReader(open("run/dev_experiments.csv"))}, key=int)))')
+          for container in $containers; do
+            python - "$container" <<'PY'
+          import csv,sys,tarfile
+          from pathlib import Path
+          container=sys.argv[1]
+          rows=[r for r in csv.DictReader(open('run/dev_experiments.csv')) if r['ophys_container_id']==container]
+          suffixes=('neural.h5','trials.parquet','stim.parquet','licks.parquet','rewards.parquet',
+                    'eye.parquet','running.parquet','raw_running.parquet','q2.parquet','meta.json')
+          with tarfile.open(f'assets/neural-container-{container}.tar','w') as tar:
+              for r in rows:
+                  for suffix in suffixes:
+                      p=Path('run/neural')/f"{r['ophys_experiment_id']}.{suffix}"
+                      if not p.is_file(): raise SystemExit(f'missing {p}')
+                      tar.add(p,arcname=p.name)
+          PY
+            shard="assets/neural-container-${container}.tar"
+            if [ "$(stat -c%s "$shard")" -gt 1932735283 ]; then
+              split -b 1800M -d -a 2 "$shard" "$shard.part-"
+              rm "$shard"
+              for part in "$shard".part-*; do
+                sha256sum "$part" | sed 's#assets/##' >> assets/SHA256SUMS
+                gh release upload "$tag" "$part" --clobber
+                rm "$part"
+              done
+            else
+              sha256sum "$shard" | sed 's#assets/##' >> assets/SHA256SUMS
+              gh release upload "$tag" "$shard" --clobber
+              rm "$shard"
+            fi
+            python - "$container" <<'PY'
+          import csv,sys
+          from pathlib import Path
+          container=sys.argv[1]
+          rows=[r for r in csv.DictReader(open('run/dev_experiments.csv')) if r['ophys_container_id']==container]
+          for r in rows:
+              for p in Path('run/neural').glob(f"{r['ophys_experiment_id']}.*"): p.unlink()
+          PY
+          done
+          gh release upload "$tag" assets/SHA256SUMS --clobber
+          gh release edit "$tag" --draft=false

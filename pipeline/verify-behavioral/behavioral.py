@@ -28,6 +28,7 @@ records which frozen split Release and source commit produced them.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import time
@@ -45,6 +46,10 @@ RR_PIET = 0.5       # 1 reward / 120 s                 (Piet)
 BR_PIET = 6.0       # 1 bout   /  10 s                 (Piet)
 GUARD = 10          # trials dropped around a label flip
 FIT_END = 0.30      # end of the decoding window
+MIN_LATE_HIT = 20
+MIN_MISS = 20
+CONTAM_MIN_HITS = 20
+MISS_SWEEP = (10, 15, 20, 25, 30)
 
 BUNDLE_SUFFIXES = (
     "trials.parquet",
@@ -224,6 +229,45 @@ def _guard(e, k):
     return keep
 
 
+def _hysteresis(rate: np.ndarray, span_minutes: np.ndarray,
+                enter: float = RR_ALLEN) -> np.ndarray:
+    """Forward Schmitt state; its width is the Poisson SE at the entry rate."""
+    state = np.zeros(len(rate), dtype=bool)
+    engaged = False
+    for i, (value, span) in enumerate(zip(rate, span_minutes)):
+        if not np.isfinite(value) or not np.isfinite(span) or span <= 0:
+            state[i] = engaged
+            continue
+        exit_at = max(0.0, enter - np.sqrt(enter / span))
+        if not engaged and value > enter:
+            engaged = True
+        elif engaged and value < exit_at:
+            engaged = False
+        state[i] = engaged
+    return state
+
+
+def _run_lengths(mask: np.ndarray) -> np.ndarray:
+    if not len(mask) or not mask.any():
+        return np.array([], dtype=int)
+    starts = np.r_[0, np.flatnonzero(mask[1:] != mask[:-1]) + 1]
+    ends = np.r_[starts[1:], len(mask)]
+    return (ends - starts)[mask[starts]]
+
+
+def _rate_with_span(ev, ts, te, half, loo=True):
+    n = len(ts); i = np.arange(n)
+    lo, hi = np.maximum(i - half, 0), np.minimum(i + half, n - 1)
+    ev = np.sort(ev)
+    cnt = (np.searchsorted(ev, te[hi]) - np.searchsorted(ev, ts[lo])).astype(float)
+    span = te[hi] - ts[lo]
+    if loo:
+        cnt -= np.searchsorted(ev, te) - np.searchsorted(ev, ts)
+        span -= te - ts
+    span_minutes = np.maximum(span, 1e-9) / 60.0
+    return cnt / span_minutes, span_minutes
+
+
 def validate_bundle_set(b: Path, ids_from: Path | None = None) -> list[int]:
     """Require complete bundles and, when supplied, an exact expected ID set."""
     if not b.is_dir():
@@ -266,108 +310,264 @@ def validate_bundle_set(b: Path, ids_from: Path | None = None) -> list[int]:
 
 def load(b: Path, bsid: int):
     tr = pd.read_parquet(b / f"{bsid}.trials.parquet")
+    sp = pd.read_parquet(b / f"{bsid}.stim.parquet")
     rw = pd.read_parquet(b / f"{bsid}.rewards.parquet")
     lk = pd.read_parquet(b / f"{bsid}.licks.parquet")["timestamps"].to_numpy(float)
     md = json.loads((b / f"{bsid}.meta.json").read_text())
     ar = next((c for c in ("auto_rewarded", "autorewarded") if c in rw.columns), None)
     earned = (rw.loc[~rw[ar].astype(bool), "timestamps"] if ar else rw["timestamps"]).to_numpy(float)
-    return tr, lk, earned, md
+    return tr, sp, lk, earned, md
 
 
-def diagnose(tr, lk, earned, md, *, bout_gap=BOUT_GAP, half=HALF_WIN,
-             rr_allen=RR_ALLEN, rr_piet=RR_PIET, br_piet=BR_PIET, guard=GUARD) -> dict:
+def _trial_novelty(tr: pd.DataFrame, sp: pd.DataFrame) -> np.ndarray:
+    """Use Allen's field, never OPHYS_4/6 names; unknown stays missing."""
+    out = np.full(len(tr), np.nan, dtype=object)
+    if "is_image_novel" not in sp.columns:
+        return out
+    values = sp["is_image_novel"]
+    valid = values.notna()
+    if "trials_id" in sp.columns and valid.any():
+        by_trial = sp.loc[valid].groupby("trials_id")["is_image_novel"].agg(
+            lambda x: bool(pd.Series(x).astype(bool).max()))
+        trial_ids = (tr["trials_id"] if "trials_id" in tr.columns
+                     else pd.Series(tr.index, index=tr.index))
+        return trial_ids.map(by_trial).to_numpy(dtype=object)
+    unique = pd.Series(values.loc[valid]).astype(bool).unique()
+    if len(unique) == 1:
+        out[:] = bool(unique[0])
+    return out
+
+
+def label_session(tr: pd.DataFrame, sp: pd.DataFrame, lk: np.ndarray,
+                  earned: np.ndarray, *, bout_gap=BOUT_GAP, half=HALF_WIN,
+                  rr_allen=RR_ALLEN, rr_piet=RR_PIET, br_piet=BR_PIET,
+                  guard=GUARD) -> tuple[pd.DataFrame, dict, dict]:
+    """Return lossless trial labels plus session and guard diagnostics."""
     ts, te = tr["start_time"].to_numpy(float), tr["stop_time"].to_numpy(float)
-    rr = _rate(earned, ts, te, half)
-    br = _rate(_bouts(lk, bout_gap), ts, te, half)
-    A = rr > rr_allen                              # reward rate only
-    B = ~((br < br_piet) & (rr < rr_piet))         # NOT(low bouts AND low rewards)
+    rr, span = _rate_with_span(earned, ts, te, half)
+    br, _ = _rate_with_span(_bouts(lk, bout_gap), ts, te, half)
+    A = rr > rr_allen
+    B = ~((br < br_piet) & (rr < rr_piet))
+    AH = _hysteresis(rr, span, rr_allen)
+    keep_a, keep_b, keep_ah = (_guard(x, guard) for x in (A, B, AH))
 
     hit = tr["hit"].astype(bool).to_numpy()
     miss = tr["miss"].astype(bool).to_numpy()
+    aborted = tr["aborted"].astype(bool).to_numpy()
     rl = tr["response_latency"].to_numpy(float)
-    rt = rl[hit & np.isfinite(rl) & (rl > 0)]
-    dur = (te.max() - ts.min()) / 60
+    late_hit = hit & np.isfinite(rl) & (rl > FIT_END)
+    early_hit = hit & np.isfinite(rl) & (rl <= FIT_END)
+    latency_status = np.where(~hit, "not_hit",
+                              np.where(np.isfinite(rl), "eligible", "ineligible_nonfinite"))
+    go = hit | miss
+    impulsive = (br >= br_piet) & (rr < rr_piet)
+    first_ten = np.arange(len(tr)) < 10
 
-    d = dict(n_trials=len(tr), abort_frac=float(tr["aborted"].astype(bool).mean()),
-             n_hit=int(hit.sum()), n_miss=int(miss.sum()),
-             session_reward_rate=float(hit.sum() / dur),
-             median_hit_rt=float(np.median(rt)) if len(rt) else np.nan,
-             # §6's "94% of hits lick after 0.30s" is an n=1 fact. This is the field.
-             contam=float((rt <= FIT_END).mean()) if len(rt) else np.nan,
-             # "miss" is not one thing: +inf = never licked, finite = licked late
-             miss_no_lick=float(np.isposinf(rl[miss]).mean()) if miss.any() else np.nan,
-             mouse_id=md.get("mouse_id"), project_code=md.get("project_code"),
+    trial_id = (tr["trials_id"].to_numpy() if "trials_id" in tr.columns
+                else np.arange(len(tr), dtype=int))
+    labels = pd.DataFrame({
+        "trial_id": trial_id,
+        "trial_index": np.arange(len(tr), dtype=int),
+        "start_time": ts,
+        "stop_time": te,
+        "change_time": (tr["change_time"].to_numpy(float)
+                        if "change_time" in tr.columns else np.full(len(tr), np.nan)),
+        "hit": hit, "late_hit": late_hit, "early_hit": early_hit,
+        "miss": miss, "aborted": aborted, "go": go,
+        "response_latency": rl,
+        "latency_status": latency_status,
+        "reward_rate": rr, "bout_rate": br, "rate_span_minutes": span,
+        "engaged_A": A, "keep_A": keep_a,
+        "engaged_B": B, "keep_B": keep_b,
+        "engaged_A_hysteretic": AH, "keep_A_hysteretic": keep_ah,
+        "impulsive_regime": impulsive,
+        "first_ten": first_ten,
+        "is_image_novel": _trial_novelty(tr, sp),
+    })
+
+    def counts(state, keep):
+        raw_go = int((go & state).sum())
+        kept_go = int((go & state & keep).sum())
+        flips = int(np.count_nonzero(state[1:] != state[:-1]))
+        return dict(raw_go=raw_go, kept_go=kept_go,
+                    guard_loss=(float((raw_go - kept_go) / raw_go) if raw_go else np.nan),
+                    transitions=flips,
+                    median_run=(float(np.median(_run_lengths(state)))
+                                if len(_run_lengths(state)) else 0.0),
+                    late_hit=int((late_hit & state & keep).sum()),
+                    hit=int((hit & state & keep).sum()),
+                    miss=int((miss & state & keep).sum()))
+
+    ca, cb, ch = counts(A, keep_a), counts(B, keep_b), counts(AH, keep_ah)
+    finite_hit_rt = rl[hit & np.isfinite(rl) & (rl > 0)]
+    contam = float((finite_hit_rt <= FIT_END).mean()) if len(finite_hit_rt) else np.nan
+    contam_status = ("ineligible_nan" if not np.isfinite(contam) else
+                     "ineligible_low_n" if len(finite_hit_rt) < CONTAM_MIN_HITS else
+                     "eligible")
+    session = dict(
+        n_trials=int(len(tr)), n_hit=int(hit.sum()), n_late_hit=int(late_hit.sum()),
+        n_early_hit=int(early_hit.sum()), n_miss=int(miss.sum()),
+        abort_frac=float(aborted.mean()), survived_frac=float((~aborted).mean()),
+        contam=contam, contam_n=int(len(finite_hit_rt)), contam_status=contam_status,
+        eng_A=float(A.mean()), eng_B=float(B.mean()), eng_A_hysteretic=float(AH.mean()),
+        late_hit_A=ca["late_hit"], miss_A=ca["miss"],
+        late_hit_B=cb["late_hit"], miss_B=cb["miss"],
+        late_hit_A_hysteretic=ch["late_hit"], miss_A_hysteretic=ch["miss"],
+        impulsive_frac=float(impulsive.mean()),
+        impulsive_go=int((impulsive & go).sum()), total_go=int(go.sum()),
+        impulsive_abort_rate=(float(aborted[impulsive].mean()) if impulsive.any() else np.nan),
+        nonimpulsive_abort_rate=(float(aborted[~impulsive].mean()) if (~impulsive).any() else np.nan),
+    )
+    guard_diag = {}
+    for name, values in (("A", ca), ("B", cb), ("A_hysteretic", ch)):
+        guard_diag.update({f"{key}_{name}": value for key, value in values.items()})
+    return labels, session, guard_diag
+
+
+def diagnose(tr, sp, lk, earned, md, *, bout_gap=BOUT_GAP, half=HALF_WIN,
+             rr_allen=RR_ALLEN, rr_piet=RR_PIET, br_piet=BR_PIET, guard=GUARD) -> dict:
+    _, d, _ = label_session(tr, sp, lk, earned, bout_gap=bout_gap, half=half,
+                            rr_allen=rr_allen, rr_piet=rr_piet,
+                            br_piet=br_piet, guard=guard)
+    d.update(mouse_id=md.get("mouse_id"), project_code=md.get("project_code"),
              equipment_name=md.get("equipment_name"), session_type=md.get("session_type"))
-    for tag, e in (("A", A), ("B", B)):
-        k = _guard(e, guard)
-        d[f"eng_{tag}"] = float(e.mean())
-        d[f"hit_{tag}"] = int((hit & e & k).sum())
-        d[f"miss_{tag}"] = int((miss & e & k).sum())
-    d["disagree"] = float((A != B).mean())
     return d
 
 
 def scan(b: Path, sweep: bool, ids_from: Path | None = None) -> int:
     ids = validate_bundle_set(b, ids_from)
-    cached = [load(b, i) for i in ids]                      # 36 MB, fits in RAM
+    cached = [load(b, i) for i in ids]
     print(f"{len(ids)} sessions loaded from {sum(f.stat().st_size for f in b.glob('*')) / 1e6:.1f} MB\n")
+    session_rows, guard_rows, label_rows, persistence_rows = [], [], [], []
+    for bsid, data in zip(ids, cached):
+        tr, sp, lk, earned, md = data
+        labels, ses, gd = label_session(tr, sp, lk, earned)
+        common = dict(behavior_session_id=int(bsid), mouse_id=md.get("mouse_id"),
+                      project_code=md.get("project_code"),
+                      equipment_name=md.get("equipment_name"),
+                      session_type=md.get("session_type"))
+        labels.insert(0, "behavior_session_id", int(bsid))
+        for key, value in reversed(list(common.items())[1:]):
+            labels.insert(1, key, value)
+        label_rows.append(labels)
+        session_rows.append({**common, **ses})
+        guard_rows.append({**common, **gd})
 
-    df = pd.DataFrame([diagnose(*c) for c in cached])
-    df.insert(0, "behavior_session_id", ids)
-    df.to_parquet(b / "_scan.parquet")
+        imp = labels["impulsive_regime"].to_numpy(bool)
+        rr_low = labels["reward_rate"].to_numpy(float) < RR_PIET
+        br_high = labels["bout_rate"].to_numpy(float) >= BR_PIET
+        shifts = np.unique(np.linspace(1, max(1, len(imp) - 1),
+                                       min(199, max(1, len(imp) - 1))).astype(int))
+        null_frac, null_run = [], []
+        for shift in shifts:
+            surrogate = rr_low & np.roll(br_high, int(shift))
+            runs = _run_lengths(surrogate)
+            null_frac.append(float(surrogate.mean()))
+            null_run.append(int(runs.max()) if len(runs) else 0)
+        observed_runs = _run_lengths(imp)
+        observed_max = int(observed_runs.max()) if len(observed_runs) else 0
+        persistence_rows.append({**common, "impulsive_frac": float(imp.mean()),
+            "max_run": observed_max, "n_runs": int(len(observed_runs)),
+            "null_mean_frac": float(np.mean(null_frac)),
+            "null_p_max_run": float((1 + sum(x >= observed_max for x in null_run)) /
+                                    (1 + len(null_run)))})
 
-    print("THE DEV DECISIONS, AS DISTRIBUTIONS")
-    print(f"{'':22s}" + "".join(f"{p:>9s}" for p in ("p10", "p25", "p50", "p75", "p90")))
-    for c in ["abort_frac", "median_hit_rt", "contam", "miss_no_lick",
-              "eng_A", "eng_B", "disagree", "miss_A", "miss_B"]:
-        q = df[c].quantile([.1, .25, .5, .75, .9])
-        print(f"{c:22s}" + "".join(f"{v:9.3f}" for v in q))
+    df = pd.DataFrame(session_rows)
+    reasons = []
+    for row in df.itertuples():
+        why = []
+        if int(row.late_hit_B) < MIN_LATE_HIT: why.append("low_late_hit")
+        if int(row.miss_B) < MIN_MISS: why.append("low_miss")
+        reasons.append(";".join(why))
+    df["behavioral_eligible"] = [not x for x in reasons]
+    df["eligibility_reasons"] = reasons
+    eligibility = df[["behavior_session_id", "mouse_id", "behavioral_eligible",
+                      "eligibility_reasons", "late_hit_B", "miss_B", "contam",
+                      "contam_n", "contam_status"]].copy()
 
-    print(f"\nsessions unusable for Q1 (>20% of hits lick inside the fit window): "
-          f"{int((df.contam > .20).sum())}/{len(df)}")
-    print(f"sessions with abort_frac > 0.90: {int((df.abort_frac > .90).sum())}/{len(df)}")
-    for tag in ("A", "B"):
-        qualified = df[df[f"miss_{tag}"] >= 20]
-        print(f"n_engaged_miss>=20 ({tag}): {len(qualified)} sessions / "
-              f"{qualified.mouse_id.nunique()} mice")
+    sweep_rows = []
+    for threshold in MISS_SWEEP:
+        for construct, late_col, miss_col in (
+                ("v3.1_B_K50", "late_hit_B", "miss_B"),
+                ("v3_A_all_C0.1", "late_hit_A", "miss_A")):
+            mask = df[miss_col].ge(threshold)
+            if construct.startswith("v3.1"):
+                mask &= df[late_col].ge(MIN_LATE_HIT)
+            selected = df.loc[mask]
+            sweep_rows.append(dict(construct=construct, miss_threshold=threshold,
+                                   min_late_hit=(MIN_LATE_HIT if construct.startswith("v3.1") else None),
+                                   n_sessions=int(len(selected)),
+                                   n_mice=int(selected.mouse_id.nunique()),
+                                   median_late_hit=float(selected[late_col].median()) if len(selected) else np.nan,
+                                   median_miss=float(selected[miss_col].median()) if len(selected) else np.nan))
 
-    if sweep:
-        # The entire reason for the two-stage split: this costs seconds, not 26 GB.
-        print("\n\nPARAMETER SWEEP  (each row = a full re-analysis of all sessions)")
-        print(f"{'bout_gap':>9s}{'half':>6s}{'rr_allen':>9s}{'br_piet':>8s}"
-              f"{'eng_A':>7s}{'eng_B':>7s}{'disagr':>8s}{'missA':>7s}{'missB':>7s}"
-              f"{'sesA':>6s}{'miceA':>7s}{'sesB':>6s}{'miceB':>7s}")
-        sweep_rows = []
-        for gap in (0.5, 0.7, 1.0):
-            for half in (15, 25, 40):
-                for rra in (1.0, 2.0):
-                    for brp in (3.0, 6.0):
-                        r = pd.DataFrame([diagnose(*c, bout_gap=gap, half=half,
-                                                   rr_allen=rra, br_piet=brp) for c in cached])
-                        qa, qb = r[r.miss_A >= 20], r[r.miss_B >= 20]
-                        row = dict(
-                            bout_gap=gap, half=half, rr_allen=rra, br_piet=brp,
-                            median_eng_A=float(r.eng_A.median()),
-                            median_eng_B=float(r.eng_B.median()),
-                            median_disagree=float(r.disagree.median()),
-                            median_miss_A=float(r.miss_A.median()),
-                            median_miss_B=float(r.miss_B.median()),
-                            qualifying_sessions_A=int(len(qa)),
-                            qualifying_mice_A=int(qa.mouse_id.nunique()),
-                            qualifying_sessions_B=int(len(qb)),
-                            qualifying_mice_B=int(qb.mouse_id.nunique()),
-                        )
-                        sweep_rows.append(row)
-                        print(f"{gap:9.1f}{half:6d}{rra:9.1f}{brp:8.1f}"
-                              f"{r.eng_A.median():7.3f}{r.eng_B.median():7.3f}"
-                              f"{r.disagree.median():8.3f}"
-                              f"{r.miss_A.median():7.0f}{r.miss_B.median():7.0f}"
-                              f"{len(qa):6d}{qa.mouse_id.nunique():7d}"
-                              f"{len(qb):6d}{qb.mouse_id.nunique():7d}")
-        pd.DataFrame(sweep_rows).to_parquet(b / "_sweep.parquet", index=False)
-        print("\n>> If eng_A/eng_B move a lot across this grid, the construct is not a\n"
-              ">> detail and §5.4 cannot be frozen by assertion. If abort_frac is bimodal,\n"
-              ">> consider a THIRD state (impulsive) rather than forcing the dichotomy.")
+    trial_labels = pd.concat(label_rows, ignore_index=True)
+    trial_labels.to_parquet(b / "_trial_labels.parquet", index=False)
+    df.to_parquet(b / "_session_scan.parquet", index=False)
+    df.to_parquet(b / "_scan.parquet", index=False)  # compatibility
+    eligibility.to_parquet(b / "_eligibility.parquet", index=False)
+    pd.DataFrame(guard_rows).to_parquet(b / "_guard_diagnostics.parquet", index=False)
+    pd.DataFrame(persistence_rows).to_parquet(b / "_persistence.parquet", index=False)
+    sweep_df = pd.DataFrame(sweep_rows)
+    sweep_df.to_parquet(b / "_yield_sweep.parquet", index=False)
+    sweep_df.to_parquet(b / "_sweep.parquet", index=False)
+    survival = df[["behavior_session_id", "mouse_id", "project_code", "n_trials",
+                   "abort_frac", "survived_frac"]].copy()
+    survival.to_parquet(b / "_survival.parquet", index=False)
+    survival_model = {"formula": "survived ~ C(project_code)", "cluster": "mouse_id"}
+    try:
+        import statsmodels.api as sm
+        trial_survival = trial_labels[["mouse_id", "project_code", "aborted"]].copy()
+        trial_survival["survived"] = (~trial_survival.aborted.astype(bool)).astype(int)
+        gee = sm.GEE.from_formula("survived ~ C(project_code)", groups="mouse_id",
+                                  data=trial_survival,
+                                  family=sm.families.Binomial(),
+                                  cov_struct=sm.cov_struct.Exchangeable()).fit()
+        survival_model.update(params={str(k): float(v) for k, v in gee.params.items()},
+                              conf_int={str(k): [float(x) for x in gee.conf_int().loc[k]]
+                                        for k in gee.params.index}, converged=bool(gee.converged))
+        from scipy.stats import bootstrap
+        mouse_survival = trial_survival.groupby(["project_code", "mouse_id"], as_index=False).survived.mean()
+        boot = {}
+        for project, group in mouse_survival.groupby("project_code"):
+            values = group.survived.to_numpy(float)
+            if len(values) >= 2:
+                ci = bootstrap((values,), np.mean, method="BCa", n_resamples=2000,
+                               random_state=np.random.default_rng(31))
+                boot[str(project)] = {"mean": float(values.mean()),
+                                      "low": float(ci.confidence_interval.low),
+                                      "high": float(ci.confidence_interval.high),
+                                      "n_mice": int(len(values))}
+        survival_model["mouse_cluster_bootstrap"] = boot
+    except Exception as exc:
+        survival_model["error"] = f"{type(exc).__name__}: {exc}"
+    (b / "_survival_model.json").write_text(json.dumps(survival_model, indent=2) + "\n")
+
+    manifest = {
+        "schema": "behavioral-v3.1",
+        "dev_ids_sha256": hashlib.sha256(
+            "\n".join(map(str, sorted(ids))).encode()).hexdigest(),
+        "n_dev_sessions": len(ids),
+        "primary": "B-engaged late-hit-vs-miss",
+        "frozen_comparator": "A-engaged all-cell C=0.1",
+        "parameters": {"bout_gap": BOUT_GAP, "half_win": HALF_WIN,
+                       "rr_allen": RR_ALLEN, "rr_piet": RR_PIET,
+                       "br_piet": BR_PIET, "guard": GUARD,
+                       "fit_end": FIT_END, "min_late_hit": MIN_LATE_HIT,
+                       "min_miss": MIN_MISS, "contam_min_hits": CONTAM_MIN_HITS,
+                       "miss_sweep": list(MISS_SWEEP)},
+        "authoritative_sesoi": None,
+        "files": ["_trial_labels.parquet", "_session_scan.parquet",
+                  "_eligibility.parquet", "_guard_diagnostics.parquet",
+                  "_persistence.parquet", "_yield_sweep.parquet", "_survival.parquet",
+                  "_survival_model.json"],
+    }
+    (b / "behavioral-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    print("DEV v3.1: late hit vs miss (never hit vs miss)")
+    print(f"eligible: {int(df.behavioral_eligible.sum())}/{len(df)} sessions / "
+          f"{df.loc[df.behavioral_eligible, 'mouse_id'].nunique()} mice")
+    print(sweep_df.to_string(index=False))
     return 0
 
 
