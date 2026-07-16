@@ -1,44 +1,50 @@
-name: split and behavioral scan
+name: freeze split
 
 on:
   push:
     branches: [main]
-    tags: ['v*-dev-lock']
-  pull_request:
-    paths:
-      - '.github/workflows/split.yml'
-      - 'pipeline/**'
-      - 'tests/**'
-      - 'requirements-pipeline.txt'
-  workflow_dispatch:
-    inputs:
-      reason:
-        description: 'Why are you running this preview? Recorded in the artifact.'
-        required: true
-        type: string
-      workers:
-        description: 'Number of pull workers (1-20)'
-        required: true
-        default: '10'
-        type: string
 
 permissions:
+  actions: write
   contents: write
-  pull-requests: write
-  issues: write
 
 concurrency:
-  group: split-behavioral-${{ github.workflow }}-${{ github.ref }}
+  group: freeze-split-once
   cancel-in-progress: false
 
 env:
+  GH_REPO: ${{ github.repository }}
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
   PIP_DISABLE_PIP_VERSION_CHECK: '1'
 
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should-run: ${{ steps.lock.outputs.should-run }}
+    steps:
+      - name: Enforce the one-time split lock
+        id: lock
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view split-lock >/dev/null 2>&1; then
+            echo 'should-run=false' >> "$GITHUB_OUTPUT"
+            echo 'split-lock already exists; the split cannot be drawn again.'
+          else
+            echo 'should-run=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Disable an already completed workflow
+        if: steps.lock.outputs.should-run == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable split.yml
+
   tests:
-    if: github.event_name != 'schedule'
+    needs: guard
+    if: needs.guard.outputs.should-run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -57,20 +63,12 @@ jobs:
           python -m py_compile pipeline/draw/split.py
           python -m py_compile pipeline/verify-behavioral/behavioral.py
 
-  prepare-split:
+  draw-and-release:
     needs: tests
-    if: >-
-      needs.tests.result == 'success' &&
-      (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    outputs:
-      shard-matrix: ${{ steps.shards.outputs.matrix }}
-      shard-count: ${{ steps.shards.outputs.count }}
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -78,290 +76,76 @@ jobs:
           cache-dependency-path: requirements-pipeline.txt
       - name: Install pipeline dependencies
         run: python -m pip install -r requirements-pipeline.txt
-
-      - name: Validate formal tag source
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          git fetch origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
-            echo '::error::The dev-lock tag must point to a commit reachable from main.'
-            exit 1
-          }
-          if [ -f split/split_manifest.json ]; then
-            echo '::error::A formal dev-lock tag cannot redraw an already committed split.'
-            exit 1
-          fi
-
-      - name: Build worker matrix
-        id: shards
-        env:
-          REQUESTED_WORKERS: ${{ github.event_name == 'workflow_dispatch' && inputs.workers || '10' }}
-        run: |
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-
-          try:
-              count = int(os.environ['REQUESTED_WORKERS'])
-          except ValueError as exc:
-              raise SystemExit('workers must be an integer from 1 through 20') from exc
-          if not 1 <= count <= 20:
-              raise SystemExit('workers must be an integer from 1 through 20')
-          with Path(os.environ['GITHUB_OUTPUT']).open('a') as out:
-              out.write(f"count={count}\n")
-              out.write(f"matrix={json.dumps(list(range(1, count + 1)))}\n")
-          PY
-
-      - name: Draw preview or reuse the frozen split
-        env:
-          PREVIEW_REASON: ${{ inputs.reason }}
+      - name: Draw and strictly verify split
         run: |
           mkdir -p run/split
-          if [ "${{ github.event_name }}" = 'workflow_dispatch' ] && [ -f split/split_manifest.json ]; then
-            cp -a split/. run/split/
-            python pipeline/draw/split.py verify split/split_manifest.json 2>&1 | tee run/split/verify.log
-          else
-            python pipeline/draw/split.py build --out run/split 2>&1 | tee run/split/build.txt
-            python pipeline/draw/split.py verify run/split/split_manifest.json 2>&1 | tee run/split/verify.log
-          fi
-          if [ "${{ github.event_name }}" = 'workflow_dispatch' ]; then
-            printf '%s\n' "$PREVIEW_REASON" > run/split/workflow_reason.txt
-          fi
-
-      - name: Upload split input
-        uses: actions/upload-artifact@v7
-        with:
-          name: split-input
-          path: run/split/
-          retention-days: 14
-          if-no-files-found: error
-          overwrite: true
-
-  pull-dev:
-    needs: prepare-split
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      max-parallel: 20
-      matrix:
-        shard: ${{ fromJSON(needs.prepare-split.outputs.shard-matrix) }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: requirements-pipeline.txt
-      - name: Install pipeline dependencies
-        run: python -m pip install -r requirements-pipeline.txt
-      - name: Download split input
-        uses: actions/download-artifact@v8
-        with:
-          name: split-input
-          path: run/split
-      - name: Restore this shard after a failed attempt
-        continue-on-error: true
-        uses: actions/download-artifact@v8
-        with:
-          name: dev-bundle-${{ matrix.shard }}-of-${{ needs.prepare-split.outputs.shard-count }}
-          path: run/bundles
-      - name: Pull and reduce shard
-        id: pull
-        continue-on-error: true
-        run: |
-          mkdir -p run/bundles
-          python pipeline/verify-behavioral/behavioral.py pull \
-            --ids-from run/split/dev_mice.csv \
-            --shard '${{ matrix.shard }}/${{ needs.prepare-split.outputs.shard-count }}' \
-            --out run/bundles \
-            --cache "$RUNNER_TEMP/allen" \
-            --retries 3 2>&1 | tee "run/bundles/pull-${{ matrix.shard }}.log"
-      - name: Upload shard, including partial diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: dev-bundle-${{ matrix.shard }}-of-${{ needs.prepare-split.outputs.shard-count }}
-          path: run/bundles/
-          retention-days: 14
-          if-no-files-found: error
-          overwrite: true
-      - name: Propagate pull failure after upload
-        if: steps.pull.outcome != 'success'
-        run: exit 1
-
-  scan-dev:
-    needs: [prepare-split, pull-dev]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: requirements-pipeline.txt
-      - name: Install pipeline dependencies
-        run: python -m pip install -r requirements-pipeline.txt
-      - name: Download split input
-        uses: actions/download-artifact@v8
-        with:
-          name: split-input
-          path: run/split
-      - name: Merge worker bundles
-        uses: actions/download-artifact@v8
-        with:
-          pattern: dev-bundle-*
-          path: run/bundles
-          merge-multiple: true
-      - name: Validate and scan the complete dev set
-        run: |
-          python pipeline/verify-behavioral/behavioral.py scan run/bundles \
-            --ids-from run/split/dev_mice.csv --sweep 2>&1 | tee run/bundles/scan.log
-          mkdir -p run/scan
-          cp run/bundles/_scan.parquet run/scan/
-          cp run/bundles/_sweep.parquet run/scan/
-          cp run/bundles/scan.log run/scan/
-          python -m pip freeze > run/environment.txt
-      - name: Upload complete preview/result
-        uses: actions/upload-artifact@v7
-        with:
-          name: pipeline-result-${{ github.run_id }}
-          path: run/
-          retention-days: 14
-          if-no-files-found: error
-          overwrite: true
-
-  publish-lock:
-    needs: scan-dev
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Download verified pipeline result
-        uses: actions/download-artifact@v8
-        with:
-          name: pipeline-result-${{ github.run_id }}
-          path: run
-      - name: Put the frozen split in the working tree
-        run: |
-          mkdir -p split
-          cp -a run/split/. split/
-      - name: Create the frozen split PR
-        id: split-pr
-        uses: peter-evans/create-pull-request@v8
-        with:
-          base: main
-          branch: split/${{ github.ref_name }}
-          title: 'split: ${{ github.ref_name }}'
-          commit-message: 'split drawn at ${{ github.ref_name }}'
-          add-paths: split/
-          body: |
-            Drawn by `${{ github.workflow }}` run `${{ github.run_id }}` from `${{ github.sha }}`.
-
-            **Before merging:**
-            - [ ] `DEV CHECKSUM` in `split/split_manifest.json` matches the OSF preregistration
-            - [ ] `strata_rule` resolved as expected; no human selected a favorable split
-            - [ ] `balance.csv` has been reviewed
-            - [ ] the Release assets and `SHA256SUMS` verify
-            - [ ] no confirm behavior was read
-
-            The tag source archive contains the pre-draw code. The generated split and
-            behavioral bundles are the assets of the matching prerelease.
-      - name: Package release assets
-        env:
-          PR_URL: ${{ steps.split-pr.outputs.pull-request-url }}
+          python pipeline/draw/split.py build --out run/split \
+            2>&1 | tee run/split/build.log
+          python pipeline/draw/split.py verify run/split/split_manifest.json \
+            2>&1 | tee run/split/verify.log
+          python -m pip freeze > run/split-environment.txt
+      - name: Package immutable release assets
         run: |
           mkdir -p assets
-          tar -czf "assets/split-${GITHUB_REF_NAME}.tar.gz" -C run split
-          tar --exclude='bundles/_scan.parquet' --exclude='bundles/_sweep.parquet' \
-            --exclude='bundles/scan.log' \
-            -czf "assets/dev-bundles-${GITHUB_REF_NAME}.tar.gz" -C run bundles
-          tar -czf "assets/behavior-scan-${GITHUB_REF_NAME}.tar.gz" -C run scan
-          cp run/environment.txt "assets/environment-${GITHUB_REF_NAME}.txt"
-          sha256sum assets/* > assets/SHA256SUMS
+          tar -czf assets/split.tar.gz -C run split
+          cp run/split-environment.txt assets/
+          cd assets
+          sha256sum split.tar.gz split-environment.txt > SHA256SUMS
+      - name: Write release notes
+        run: |
           python - <<'PY'
-          import json, os
+          import json
+          import os
+          import csv
           from pathlib import Path
 
-          manifest = json.loads(Path('run/split/split_manifest.json').read_text())
-          run_url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-          notes = f"""# Frozen dev split and behavioral scan
+          manifest = json.loads(Path("run/split/split_manifest.json").read_text())
+          with Path("run/split/dev_mice.csv").open(newline="") as handle:
+              n_dev_sessions = sum(1 for _ in csv.DictReader(handle))
+          run_url = (
+              f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+              f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          )
+          notes = f"""# Frozen dev split
 
           - Source commit: `{os.environ['GITHUB_SHA']}`
           - Workflow run: {run_url}
           - Allen manifest: `{manifest['allen_manifest']}`
           - DEV checksum: `{manifest['dev_checksum']}`
-          - Split PR: {os.environ.get('PR_URL') or 'not created'}
+          - DEV sessions: {n_dev_sessions}
 
-          The source archive attached automatically by GitHub is the pre-draw code at
-          the dev-lock tag. The generated split, reduced dev-only behavioral bundles,
-          scan outputs, environment, and checksums are the Release assets below.
-          Confirm behavior was not downloaded or scanned.
+          This Release is the immutable split input for the manual behavioral-scan
+          workflow. No behavioral data was read while drawing this split.
           """
-          Path('release-notes.md').write_text('\n'.join(line.strip() for line in notes.splitlines()) + '\n')
+          Path("release-notes.md").write_text(
+              "\n".join(line.strip() for line in notes.splitlines()) + "\n"
+          )
           PY
-      - name: Publish public prerelease
+      - name: Publish frozen split Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" assets/* \
-            --verify-tag --prerelease --latest=false \
-            --title "$GITHUB_REF_NAME: frozen dev split" \
-            --notes-file release-notes.md
-
-  drift:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: requirements-pipeline.txt
-      - name: Install pipeline dependencies
-        run: python -m pip install -r requirements-pipeline.txt
-      - name: Detect a frozen split
-        id: frozen
-        run: |
-          if [ -f split/split_manifest.json ]; then
-            echo 'present=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'present=false' >> "$GITHUB_OUTPUT"
-            echo 'No frozen split is committed; weekly drift check is a no-op.'
+          if gh release view split-lock >/dev/null 2>&1; then
+            echo '::error::split-lock appeared during this run; refusing to overwrite it.'
+            exit 1
           fi
-      - name: Strictly verify the frozen split
-        id: verify
-        if: steps.frozen.outputs.present == 'true'
-        continue-on-error: true
-        run: python pipeline/draw/split.py verify split/split_manifest.json 2>&1 | tee verify.log
-      - name: Open an issue if provenance drifted
-        if: steps.frozen.outputs.present == 'true' && steps.verify.outcome == 'failure'
+          gh release create split-lock assets/* \
+            --target "$GITHUB_SHA" \
+            --title 'split-lock: frozen dev split' \
+            --notes-file release-notes.md \
+            --latest
+      - name: Permanently disable split workflow after publication
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh label create provenance --color B60205 \
-            --description 'Dataset and analysis provenance drift' --force
-          python - <<'PY'
-          from datetime import date
-          from pathlib import Path
-
-          log = Path('verify.log').read_text()
-          Path('drift-issue.md').write_text(
-              'The recorded split failed strict reproduction against the current Allen '
-              'manifest or cohort metadata.\n\n**Do not redraw the split.** Pin the '
-              'recorded manifest and document the drift as a deviation.\n\n```\n'
-              + log[-50000:] + '\n```\n')
-          Path('drift-title.txt').write_text(
-              f'split provenance drift ({date.today().isoformat()})')
-          PY
-          gh issue create --title "$(cat drift-title.txt)" --label provenance \
-            --body-file drift-issue.md
-      - name: Fail the scheduled run after reporting drift
-        if: steps.frozen.outputs.present == 'true' && steps.verify.outcome == 'failure'
-        run: exit 1
+        run: gh workflow disable split.yml
+      - name: Upload short-lived diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: split-${{ github.run_id }}
+          path: |
+            run/split/
+            assets/
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true

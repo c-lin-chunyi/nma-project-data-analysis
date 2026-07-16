@@ -1,7 +1,10 @@
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
+import warnings
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +17,7 @@ SPEC = importlib.util.spec_from_file_location(
     "behavioral_pipeline", ROOT / "pipeline/verify-behavioral/behavioral.py")
 behavioral = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(behavioral)
+warnings.filterwarnings("ignore")
 
 
 def write_bundle(out: Path, bsid: int, mouse_id="42") -> None:
@@ -70,7 +74,8 @@ class BehavioralTests(unittest.TestCase):
         )
         cache = mock.Mock()
         cache.get_behavior_session.return_value = FakeSession()
-        with tempfile.TemporaryDirectory() as tmp, mock.patch(target, return_value=cache):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(target, return_value=cache), \
+                redirect_stdout(io.StringIO()):
             root = Path(tmp)
             out = root / "bundles"
             report_name = "_pull_01-of-01.json"
@@ -102,7 +107,8 @@ class BehavioralTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch(target, return_value=FlakyCache()), \
-                mock.patch.object(behavioral.time, "sleep"):
+                mock.patch.object(behavioral.time, "sleep"), \
+                redirect_stdout(io.StringIO()):
             root = Path(tmp)
             out = root / "bundles"
             self.assertEqual(behavioral.pull(
@@ -133,7 +139,8 @@ class BehavioralTests(unittest.TestCase):
             write_bundle(root, 123)
             ids = root / "ids.csv"
             pd.DataFrame({"behavior_session_id": [123]}).to_csv(ids, index=False)
-            self.assertEqual(behavioral.scan(root, True, ids), 0)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(behavioral.scan(root, True, ids), 0)
             self.assertTrue((root / "_scan.parquet").is_file())
             sweep = pd.read_parquet(root / "_sweep.parquet")
             self.assertEqual(len(sweep), 36)

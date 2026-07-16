@@ -5,8 +5,10 @@ Behaviour pipeline · two stages, because they have opposite cost profiles.
   stage 1   pull    sharded, dumb, ONCE.  26.4 GB of NWB -> 36 MB of bundles
   stage 2   scan    local, seconds.       sweep every construct parameter freely
 
-    python behavior.py pull --ids-from split/dev_mice.csv --shard 3/10 --out bundles/
-    python behavior.py scan bundles/ --sweep
+    python pipeline/verify-behavioral/behavioral.py pull \
+        --ids-from split/dev_mice.csv --shard 3/10 --out bundles/
+    python pipeline/verify-behavioral/behavioral.py scan bundles/ \
+        --ids-from split/dev_mice.csv --sweep
 
 Why not one pass
 ----------------
@@ -20,8 +22,8 @@ The reduction ratio is ~1500:1 because an NWB carries the whole session and we
 need three tables. Everything behaviour-related goes in the bundle, on the
 Appendix A principle: re-pulling costs 26 GB, over-storing costs 18 MB.
 
-Bundles are small enough to commit. That makes stage 2 reproducible from the repo
-with no AWS access at all, by anyone, forever.
+Bundles and scan outputs are published as Release assets. The manual workflow
+records which frozen split Release and source commit produced them.
 """
 from __future__ import annotations
 

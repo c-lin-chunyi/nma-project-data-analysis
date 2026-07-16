@@ -1,7 +1,9 @@
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -80,7 +82,7 @@ class SplitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "split_manifest.json"
             path.write_text(json.dumps(manifest))
-            with mock.patch(target, return_value=cache):
+            with mock.patch(target, return_value=cache), redirect_stdout(io.StringIO()):
                 self.assertEqual(split_pipeline.verify(path), 0)
                 cache.manifest = "manifest-v2.json"
                 self.assertEqual(split_pipeline.verify(path), 1)
