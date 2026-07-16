@@ -471,7 +471,7 @@ def _oof_auc(X: np.ndarray, y: np.ndarray, raw_index: np.ndarray, C: float,
 
 
 def _session_data(root: Path, oeid: int, labels: pd.DataFrame, signal="events",
-                  *, baselined: bool = True, start: float = FIT_START,
+                  *, baselined: bool = True, start: float | None = FIT_START,
                   end: float = FIT_END):
     import h5py
     with h5py.File(root / f"{oeid}.neural.h5", "r") as h5:
@@ -481,9 +481,14 @@ def _session_data(root: Path, oeid: int, labels: pd.DataFrame, signal="events",
         suffix = "baselined" if baselined else "unbaselined"
         tensor = tl[f"{signal}_{suffix}"][:]
         cells = h5["cell_specimen_id"][:]
-    window = (rel >= start) & (rel < end)
+    # ``start=None`` means the complete stored interval before ``end``.  This
+    # is required for the baseline-integrity invariant: extraction subtracts
+    # the mean over every saved rel_time < 0 sample, not merely [-1, 0).
+    window = ((rel < end) if start is None else
+              ((rel >= start) & (rel < end)))
     if not window.any():
-        raise ValueError(f"empty feature window [{start}, {end}) for {oeid}")
+        interval = f"rel_time < {end}" if start is None else f"[{start}, {end})"
+        raise ValueError(f"empty feature window {interval} for {oeid}")
     feature = tensor[:, :, window].mean(axis=2)
     selected = labels.set_index("trial_id").reindex(ids)
     return feature, cells, selected.reset_index()
@@ -981,10 +986,14 @@ def scan(root: Path, experiment_manifest: Path, behavior_dir: Path, out: Path,
         bsid, oeid = int(row.behavior_session_id), int(row.ophys_experiment_id)
         session_labels = labels[labels.behavior_session_id.eq(bsid)]
         X, _, lab = _session_data(root, oeid, session_labels)
+        # Match the extraction invariant exactly: baselining used every saved
+        # rel_time < 0 sample (WINDOW_START through zero).  The authoritative
+        # unbaselined anchor intentionally remains the registered [-1, 0) mean.
         baseline_pre, _, _ = _session_data(
-            root, oeid, session_labels, baselined=True, start=-1.0, end=0.0)
+            root, oeid, session_labels, baselined=True, start=None, end=0.0)
         anchor_pre, _, _ = _session_data(
-            root, oeid, session_labels, baselined=False, start=-1.0, end=0.0)
+            root, oeid, session_labels, baselined=False,
+            start=PUPIL_START, end=PUPIL_END)
         unbaselined_post, _, _ = _session_data(
             root, oeid, session_labels, baselined=False, start=FIT_START, end=FIT_END)
         ses = sessions.loc[sessions.behavior_session_id.eq(bsid)].iloc[0]

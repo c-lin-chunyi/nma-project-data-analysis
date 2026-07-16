@@ -153,6 +153,16 @@ class NeuralTests(unittest.TestCase):
         self.assertEqual(result["constant_score_auc"], .5)
         self.assertEqual(result["max_prechange_mean_dv_range"], 0)
 
+    def test_baseline_integrity_uses_full_extraction_window_not_anchor_window(self):
+        source = inspect.getsource(neural.scan)
+        self.assertIn("baselined=True, start=None, end=0.0", source)
+        self.assertIn("baselined=False,\n            start=PUPIL_START, end=PUPIL_END", source)
+        rel = np.array([-1.25, -1.0, -.75, -.5, -.25, 0.0])
+        raw = np.array([4.0, -1.0, -1.0, -1.0, -1.0, 99.0])
+        baselined = raw - raw[rel < 0].mean()
+        self.assertAlmostEqual(baselined[rel < 0].mean(), 0.0)
+        self.assertNotAlmostEqual(baselined[(rel >= -1.0) & (rel < 0)].mean(), 0.0)
+
     def test_q2_nuisance_models_use_natural_prevalence(self):
         source = inspect.getsource(neural._q2_session)
         self.assertIn('class_weight=None', source)
