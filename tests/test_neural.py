@@ -1,5 +1,6 @@
 import importlib.util
 import inspect
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,11 @@ SPEC = importlib.util.spec_from_file_location(
     "neural_pipeline", ROOT / "pipeline/verify-neural/neural.py")
 neural = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(neural)
+sys.modules["neural"] = neural
+V33_SPEC = importlib.util.spec_from_file_location(
+    "neural_v33", ROOT / "pipeline/verify-neural/v33.py")
+v33 = importlib.util.module_from_spec(V33_SPEC)
+V33_SPEC.loader.exec_module(v33)
 
 
 class NeuralTests(unittest.TestCase):
@@ -313,6 +319,95 @@ class NeuralTests(unittest.TestCase):
         self.assertIn("calibrator", text)
         self.assertIn("usable_positive", text)
         self.assertIn("no CONFIRM workflow", text)
+
+    def test_v33_conditional_auc_is_computed_within_test_folds(self):
+        rng = np.random.default_rng(33)
+        y = np.tile([0, 1], 50)
+        X = rng.normal(scale=.2, size=(len(y), 4)) + y[:, None]
+        metrics, folds, error = v33._blocked_auc(
+            X, y, np.arange(len(y)), C=1e-4, seed=0,
+            class_weight=None, minimum_estimable_folds=3)
+        self.assertIsNone(error)
+        self.assertEqual(metrics["n_estimable_folds"], 5)
+        self.assertGreater(metrics["conditional_auc"], .9)
+        self.assertEqual(metrics["comparable_pairs"],
+                         sum(row["comparable_pairs"] for row in folds))
+
+    def test_v33_sesoi_anchor_status_is_typed(self):
+        positive = v33._typed_status(
+            {"low": .55, "high": .70}, null=.5, coverage=True)
+        reverse = v33._typed_status(
+            {"low": .20, "high": .40}, null=.5, coverage=True)
+        unavailable = v33._typed_status(
+            {"low": None, "high": None}, null=.5, coverage=False)
+        self.assertEqual(positive["status"], "usable_positive")
+        self.assertEqual(reverse["status"], "invalid_direction")
+        self.assertEqual(unavailable["status"], "nonestimable")
+
+    def test_v33_state_probability_is_inner_calibrated(self):
+        rng = np.random.default_rng(34)
+        y = np.tile([0, 1], 60)
+        X = rng.normal(scale=.3, size=(len(y), 50)) + y[:, None]
+        metrics, folds, error = v33._state_seed(
+            X, y, np.arange(len(y)), seed=0)
+        self.assertIsNone(error)
+        self.assertEqual(len(folds), 5)
+        self.assertGreater(metrics["conditional_auc"], .9)
+        self.assertGreater(metrics["calibrated_logloss_gain"], 0)
+
+    def test_v33_one_se_rule_chooses_strongest_eligible_regularization(self):
+        losses = {
+            1e-4: [.520] * 4,
+            1e-3: [.505] * 4,
+            1e-2: [.480, .520, .480, .520],
+            1e-1: [.515] * 4,
+            1.0: [.530] * 4,
+            10.0: [.540] * 4,
+            100.0: [.550] * 4,
+        }
+
+        def fake_inner(frame, y, raw, *, C, include_neural):
+            return np.full(len(y), .5), losses[C], None
+
+        frame = pd.DataFrame({"x": np.arange(20)})
+        with mock.patch.object(v33, "_inner_nuisance", side_effect=fake_inner):
+            selected, probability, candidates, error = v33._select_c(
+                frame, np.tile([0, 1], 10), np.arange(20),
+                include_neural=False)
+        self.assertIsNone(error)
+        self.assertEqual(selected, 1e-3)
+        self.assertTrue(np.all(probability == .5))
+        self.assertEqual(sum(row["selected"] for row in candidates), 1)
+
+    def test_v33_workflow_is_cache_only_and_independently_versioned(self):
+        workflow = (ROOT / ".github/workflows/neural-dev-v3.3.yml").read_text()
+        source = (ROOT / "pipeline/verify-neural/v33.py").read_text()
+        self.assertIn("feature_cache_release:", workflow)
+        self.assertIn("neural-dev-features-v1-", workflow)
+        self.assertIn("pipeline/verify-neural/v33.py scan", workflow)
+        self.assertIn('tag="neural-dev-v3.3-${GITHUB_RUN_ID}"', workflow)
+        self.assertIn("neural_bundle_download=false", workflow)
+        self.assertIn("allen_nwb_download=false", workflow)
+        self.assertIn("--prerelease --draft", workflow)
+        self.assertIn("--draft=false", workflow)
+        self.assertNotIn("neural_data_release:", workflow)
+        self.assertNotIn("neural.py pull", workflow)
+        self.assertNotIn("allen-neural", workflow)
+        self.assertNotIn("allensdk", source)
+        self.assertNotIn(".neural.h5", source)
+
+    def test_neural_bundle_workflow_owns_pull_and_bundle_publication(self):
+        workflow = (ROOT / ".github/workflows/neural-bundle.yml").read_text()
+        self.assertIn("reuse_run_id:", workflow)
+        self.assertIn("pipeline/verify-neural/neural.py manifest", workflow)
+        self.assertIn("pipeline/verify-neural/neural.py pull", workflow)
+        self.assertIn("Pull one DEV container from Allen", workflow)
+        self.assertIn("source_artifacts_reused", workflow)
+        self.assertIn('tag="neural-dev-data-${GITHUB_RUN_ID}"', workflow)
+        self.assertIn("split -b 1800M", workflow)
+        self.assertIn("--draft=false", workflow)
+        self.assertNotIn("pipeline/verify-neural/v33.py", workflow)
+        self.assertNotIn("neural.py scan", workflow)
 
 
 if __name__ == "__main__":

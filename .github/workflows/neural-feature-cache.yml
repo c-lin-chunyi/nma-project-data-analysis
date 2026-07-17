@@ -75,7 +75,7 @@ jobs:
           assert source['schema']=='neural-dev-data-v1'
           assert source['n_experiments']==70 and source['n_containers']==10
           assert source['behavioral_release']==os.environ['BEHAVIOR_TAG']
-          assert source['allen_nwb_download'] is False
+          assert isinstance(source.get('allen_nwb_download'), bool)
           assert len(table)==70 and table.ophys_experiment_id.astype(int).nunique()==70
           assert table.ophys_container_id.astype(int).nunique()==10
           assert int(table.role.eq('active').sum())==50 and int(table.role.eq('passive').sum())==20
@@ -191,6 +191,7 @@ jobs:
               digest,name=checksum.read_text().split()[:2]
               path=Path('run/cache-download')/name
               parts.append({'name':name,'sha256':digest,'size':path.stat().st_size})
+          source=json.loads(Path('assets/data-package-manifest.json').read_text())
           manifest={
               'schema':'neural-dev-feature-cache-v1',
               'neural_data_release':os.environ['DATA_TAG'],
@@ -202,10 +203,12 @@ jobs:
               'n_containers':int(table.ophys_container_id.nunique()),
               'parts':parts,'feature_file_checksums':'feature-files.sha256',
               'fold_independent':True,'contains_oof_predictions':False,
+              'source_allen_nwb_download':source['allen_nwb_download'],
               'analysis_only_materialization':True,'allen_nwb_download':False,
           }
           Path('assets/feature-cache-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
           environment=Path('assets/feature-cache-environment.txt').read_bytes()
+          source=json.loads(Path('assets/data-package-manifest.json').read_text())
           provenance={
               'date_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
               'code_commit':os.environ['GITHUB_SHA'],'python':platform.python_version(),
@@ -214,6 +217,7 @@ jobs:
               'workflow_run':f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
               'neural_data_release':os.environ['DATA_TAG'],
               'data_manifest_sha256':os.environ['DATA_MANIFEST_SHA'],
+              'source_allen_nwb_download':source['allen_nwb_download'],
               'pip_freeze_sha256':hashlib.sha256(environment).hexdigest(),
               'analysis_only_materialization':True,'allen_nwb_download':False,
           }

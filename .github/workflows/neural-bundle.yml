@@ -1,0 +1,399 @@
+name: build immutable neural DEV bundle
+
+run-name: neural bundle · ${{ inputs.behavioral_release }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      behavioral_release:
+        description: 'Exact behavioral-v3.1-* Release tag'
+        required: true
+        type: string
+      reuse_run_id:
+        description: 'Optional prior neural extraction run whose ten shard artifacts should be reused'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: neural-bundle-${{ inputs.behavioral_release }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  SHARD_COUNT: '10'
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pinned extraction dependencies
+        run: python -m pip install -r requirements-pipeline.txt
+      - name: Resolve behavioral source or reusable extraction artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+        run: |
+          set -euo pipefail
+          case "$BEHAVIOR_TAG" in
+            behavioral-v3.1-*) ;;
+            *) echo "::error::exact behavioral-v3.1-* tag required"; exit 1 ;;
+          esac
+          mkdir -p run/source run/behavior run/split
+          if [ -n "$REUSE_RUN_ID" ]; then
+            case "$REUSE_RUN_ID" in
+              *[!0-9]*|'') echo "::error::reuse_run_id must be numeric"; exit 1 ;;
+            esac
+            workflow=$(gh run view "$REUSE_RUN_ID" --json workflowName --jq .workflowName)
+            title=$(gh run view "$REUSE_RUN_ID" --json displayTitle --jq .displayTitle)
+            source_sha=$(gh run view "$REUSE_RUN_ID" --json headSha --jq .headSha)
+            export source_sha
+            case "$workflow" in
+              'build immutable neural DEV bundle')
+                test "$title" = "neural bundle · $BEHAVIOR_TAG"
+                input_artifact=neural-bundle-input
+                ;;
+              'neural DEV v3.1 from behavioral Release')
+                test "$title" = "neural DEV · $BEHAVIOR_TAG"
+                input_artifact=neural-dev-input
+                ;;
+              *)
+                echo "::error::run $REUSE_RUN_ID is not a supported neural extraction workflow"
+                exit 1
+                ;;
+            esac
+            rm -rf run
+            mkdir -p run
+            gh run download "$REUSE_RUN_ID" -n "$input_artifact" -D run
+            test -s run/dev_experiments.csv
+            test -s run/behavior/behavioral-manifest.json
+            python - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path('run/extraction-source.json').write_text(json.dumps({
+              'source_extraction_run':int(os.environ['REUSE_RUN_ID']),
+              'source_commit':os.environ['source_sha'],
+              'source_artifacts_reused':True,
+              'allen_nwb_download':False,
+          },indent=2)+'\n')
+          PY
+          else
+            gh release download "$BEHAVIOR_TAG" \
+              -p SHA256SUMS -p source-split.tar.gz \
+              -p behavioral-v3.1-scan.tar.gz -p behavioral-manifest.json \
+              -D run/source
+            (cd run/source && \
+              grep -E '  (source-split.tar.gz|behavioral-v3.1-scan.tar.gz|behavioral-manifest.json)$' SHA256SUMS | \
+              sha256sum --check -)
+            tar -xzf run/source/source-split.tar.gz -C run
+            tar -xzf run/source/behavioral-v3.1-scan.tar.gz -C run/behavior
+            cmp run/source/behavioral-manifest.json run/behavior/behavioral-manifest.json
+            test -s run/split/dev_mice.csv
+            python pipeline/verify-neural/neural.py manifest \
+              --ids-from run/split/dev_mice.csv \
+              --out run/dev_experiments.csv \
+              --cache "$RUNNER_TEMP/allen-meta"
+            python - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path('run/extraction-source.json').write_text(json.dumps({
+              'source_extraction_run':int(os.environ['GITHUB_RUN_ID']),
+              'source_commit':os.environ['GITHUB_SHA'],
+              'source_artifacts_reused':False,
+              'allen_nwb_download':True,
+          },indent=2)+'\n')
+          PY
+          fi
+          python - <<'PY'
+          import pandas as pd
+          table=pd.read_csv('run/dev_experiments.csv')
+          assert len(table)==70
+          assert table.ophys_experiment_id.astype(int).nunique()==70
+          assert table.ophys_container_id.astype(int).nunique()==10
+          assert int(table.role.eq('active').sum())==50
+          assert int(table.role.eq('passive').sum())==20
+          PY
+          rm -rf run/source
+      - name: Upload normalized extraction inputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: neural-bundle-input
+          path: |
+            run/dev_experiments.csv
+            run/behavior/behavioral-manifest.json
+            run/split/dev_mice.csv
+            run/extraction-source.json
+          retention-days: 14
+          if-no-files-found: error
+
+  pull:
+    needs: resolve
+    if: ${{ inputs.reuse_run_id == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pinned extraction dependencies
+        run: python -m pip install -r requirements-pipeline.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-bundle-input
+          path: run
+      - name: Pull one DEV container from Allen
+        id: pull
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p run/neural
+          python pipeline/verify-neural/neural.py pull \
+            --manifest run/dev_experiments.csv \
+            --shard '${{ matrix.shard }}/${{ env.SHARD_COUNT }}' \
+            --out run/neural \
+            --cache "$RUNNER_TEMP/allen-neural" \
+            --retries 3 \
+            2>&1 | tee "run/neural/pull-${{ matrix.shard }}.log"
+      - name: Upload shard for publication or later reuse
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: neural-container-${{ matrix.shard }}
+          path: run/neural/
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+      - name: Propagate extraction failure
+        if: steps.pull.outcome != 'success'
+        run: exit 1
+
+  publish:
+    needs: [resolve, pull]
+    if: ${{ always() && needs.resolve.result == 'success' && (needs.pull.result == 'success' || needs.pull.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pinned validation dependencies
+        run: python -m pip install -r requirements-pipeline.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-bundle-input
+          path: run
+      - uses: actions/download-artifact@v8
+        if: ${{ inputs.reuse_run_id == '' }}
+        with:
+          pattern: neural-container-*
+          path: run/neural
+          merge-multiple: true
+      - name: Restore reusable extraction artifacts
+        if: ${{ inputs.reuse_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p run/neural
+          for shard in $(seq 1 10); do
+            gh run download "$REUSE_RUN_ID" \
+              -n "neural-container-$shard" -D run/neural
+          done
+      - name: Validate and stream containers into immutable bundle Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          set -euo pipefail
+          tag="neural-dev-data-${GITHUB_RUN_ID}"
+          mkdir -p assets/extraction-reports work
+          source_run=$(python -c 'import json; print(json.load(open("run/extraction-source.json"))["source_extraction_run"])')
+          source_sha=$(python -c 'import json; print(json.load(open("run/extraction-source.json"))["source_commit"])')
+          reused=$(python -c 'import json; print(str(json.load(open("run/extraction-source.json"))["source_artifacts_reused"]).lower())')
+          downloaded=$(python -c 'import json; print(str(json.load(open("run/extraction-source.json"))["allen_nwb_download"]).lower())')
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          printf '# Immutable neural DEV bundle\n\n- Behavioral source: `%s`\n- Extraction source run: `%s`\n- Source commit: `%s`\n- Build run: %s\n- Reused extraction artifacts: **%s**\n- Allen NWB downloaded in this build: **%s**\n\nThis Release contains the exact 50 active + 20 passive DEV experiment bundles. Analysis is intentionally separate.\n' \
+            "$BEHAVIOR_TAG" "$source_run" "$source_sha" "$run_url" \
+            "$reused" "$downloaded" > release-notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true || {
+              echo "::error::$tag is already public and immutable"; exit 1;
+            }
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" \
+              --title "$tag: immutable DEV neural bundles" \
+              --notes-file release-notes.md --latest=false --prerelease --draft
+          fi
+          : > assets/SHA256SUMS
+          : > assets/bundle-files.sha256
+          : > assets/parts.tsv
+          containers=$(python -c 'import pandas as pd; print(" ".join(map(str,sorted(pd.read_csv("run/dev_experiments.csv").ophys_container_id.astype(int).unique()))))')
+          for container in $containers; do
+            while IFS= read -r stale; do
+              [ -z "$stale" ] || gh release delete-asset "$tag" "$stale" -y
+            done < <(gh release view "$tag" --json assets --jq '.assets[].name' | \
+              grep -E "^neural-container-${container}[.]tar[.]part-" || true)
+            python - "$container" <<'PY'
+          import hashlib, importlib.util, sys
+          from pathlib import Path
+          import pandas as pd
+          container=int(sys.argv[1])
+          spec=importlib.util.spec_from_file_location(
+              'neural_pipeline','pipeline/verify-neural/neural.py')
+          module=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          manifest=pd.read_csv('run/dev_experiments.csv')
+          selected=manifest[
+              manifest.ophys_container_id.astype(int).eq(container)].copy()
+          module.validate_bundles(Path('run/neural'), selected)
+          failures=module.appendix_a_failures(Path('run/neural'), selected)
+          if failures:
+              raise SystemExit(
+                  f'Appendix-A validation failed for container {container}: {failures}')
+          expected=[]
+          for oeid in selected.ophys_experiment_id.astype(int):
+              expected.extend(
+                  path.name for path in module.bundle_paths(Path('run/neural'), oeid))
+          actual={
+              path.name for path in Path('run/neural').iterdir()
+              if path.is_file() and path.name[:1].isdigit() and
+              int(path.name.split('.',1)[0]) in
+              set(selected.ophys_experiment_id.astype(int))
+          }
+          if actual != set(expected):
+              raise SystemExit(
+                  f'container package mismatch: missing={sorted(set(expected)-actual)}, '
+                  f'extra={sorted(actual-set(expected))}')
+          Path('work/files.txt').write_text('\n'.join(sorted(expected))+'\n')
+          def sha256(path):
+              digest=hashlib.sha256()
+              with path.open('rb') as stream:
+                  for chunk in iter(lambda:stream.read(8*1024*1024),b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          with Path('assets/bundle-files.sha256').open('a') as output:
+              for name in sorted(expected):
+                  output.write(f'{sha256(Path("run/neural")/name)}  {name}\n')
+          PY
+            find run/neural -maxdepth 1 -name '_pull*.json' \
+              -exec cp {} assets/extraction-reports/ \;
+            tar -C run/neural -cf - -T work/files.txt | \
+              split -b 1800M -d -a 2 - \
+              "assets/neural-container-${container}.tar.part-"
+            for part in assets/neural-container-${container}.tar.part-*; do
+              name=$(basename "$part")
+              digest=$(sha256sum "$part" | cut -d' ' -f1)
+              size=$(stat -c%s "$part")
+              printf '%s  %s\n' "$digest" "$name" >> assets/SHA256SUMS
+              printf '%s\t%s\t%s\t%s\n' \
+                "$container" "$name" "$digest" "$size" >> assets/parts.tsv
+              gh release upload "$tag" "$part" --clobber
+              rm "$part"
+            done
+            python - "$container" <<'PY'
+          import pandas as pd, sys
+          from pathlib import Path
+          container=int(sys.argv[1])
+          table=pd.read_csv('run/dev_experiments.csv')
+          ids=table.loc[
+              table.ophys_container_id.astype(int).eq(container),
+              'ophys_experiment_id'].astype(int)
+          for oeid in ids:
+              for path in Path('run/neural').glob(f'{oeid}.*'):
+                  path.unlink()
+          PY
+          done
+      - name: Publish manifests and finalize bundle Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          set -euo pipefail
+          tag="neural-dev-data-${GITHUB_RUN_ID}"
+          cp run/dev_experiments.csv run/behavior/behavioral-manifest.json assets/
+          tar -czf assets/extraction-reports.tar.gz -C assets/extraction-reports .
+          python -m pip freeze > assets/neural-bundle-environment.txt
+          python - <<'PY'
+          import csv, datetime, hashlib, json, os
+          from pathlib import Path
+          source=json.loads(Path('run/extraction-source.json').read_text())
+          experiments=list(csv.DictReader(Path('assets/dev_experiments.csv').open()))
+          parts=[]
+          for line in Path('assets/parts.tsv').read_text().splitlines():
+              container,name,digest,size=line.split('\t')
+              parts.append({
+                  'container_id':int(container),'name':name,
+                  'sha256':digest,'size':int(size)})
+          manifest={
+              'schema':'neural-dev-data-v1',
+              'source_extraction_run':source['source_extraction_run'],
+              'source_commit':source['source_commit'],
+              'behavioral_release':os.environ['BEHAVIOR_TAG'],
+              'n_experiments':len(experiments),
+              'n_containers':len({
+                  row['ophys_container_id'] for row in experiments}),
+              'parts':parts,
+              'bundle_checksum_file':'bundle-files.sha256',
+              'source_artifacts_reused':source['source_artifacts_reused'],
+              'analysis_only_packaging':False,
+              'allen_nwb_download':source['allen_nwb_download'],
+          }
+          Path('assets/data-package-manifest.json').write_text(
+              json.dumps(manifest,indent=2)+'\n')
+          provenance={
+              'date_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'packaging_commit':os.environ['GITHUB_SHA'],
+              'source_commit':source['source_commit'],
+              'source_extraction_run':source['source_extraction_run'],
+              'source_artifacts_reused':source['source_artifacts_reused'],
+              'allen_nwb_download':source['allen_nwb_download'],
+              'workflow_run':f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }
+          Path('assets/neural-data-provenance.json').write_text(
+              json.dumps(provenance,indent=2)+'\n')
+          PY
+          rm assets/parts.tsv
+          for file in assets/bundle-files.sha256 \
+                      assets/data-package-manifest.json \
+                      assets/dev_experiments.csv \
+                      assets/behavioral-manifest.json \
+                      assets/extraction-reports.tar.gz \
+                      assets/neural-bundle-environment.txt \
+                      assets/neural-data-provenance.json; do
+            sha256sum "$file" | sed 's#assets/##' >> assets/SHA256SUMS
+            gh release upload "$tag" "$file" --clobber
+          done
+          gh release upload "$tag" assets/SHA256SUMS --clobber
+          python - <<'PY'
+          import json
+          manifest=json.load(open('assets/data-package-manifest.json'))
+          assert manifest['n_experiments']==70
+          assert manifest['n_containers']==10
+          assert len({part['container_id'] for part in manifest['parts']})==10
+          PY
+          gh release edit "$tag" --draft=false --prerelease --latest=false
