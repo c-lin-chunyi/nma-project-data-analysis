@@ -105,6 +105,23 @@ for _, _, distribution in requirements:
 print("Runtime versions:", versions)
 """
 
+NEURAL_DEPENDENCY_SETUP = DEPENDENCY_SETUP + r"""
+
+# Plotly's JavaScript renderer is unreliable when nested inside
+# ipywidgets.Output/Tab in Colab. Kaleido provides a PNG renderer for those
+# panels while the surrounding selectors and buttons remain interactive.
+google_package = find_spec("google")
+in_colab_runtime = (
+    "google.colab" in sys.modules
+    or (google_package is not None and find_spec("google.colab") is not None)
+)
+if in_colab_runtime and find_spec("kaleido") is None:
+    print("Installing the Colab-safe Plotly image renderer: kaleido==0.2.1")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "--quiet", "kaleido==0.2.1"
+    ])
+"""
+
 
 BEHAVIOR_LOAD = r"""
 import numpy as np
@@ -415,16 +432,36 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import ipywidgets as widgets
-from IPython.display import HTML, clear_output, display
+from IPython.display import HTML, Image, clear_output, display
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_curve
 from sklearn.preprocessing import StandardScaler
+
+IN_COLAB = "google.colab" in sys.modules
 
 try:
     from google.colab import output as colab_output
     colab_output.enable_custom_widget_manager()
 except ImportError:
     pass
+
+
+def display_widget_figure(figure):
+    # Render reliably inside nested Colab widgets.
+    if IN_COLAB:
+        try:
+            display(Image(figure.to_image(format="png", scale=1.25)))
+            return
+        except Exception as exc:
+            display(HTML(
+                "<b>Static rendering failed; trying Colab's interactive "
+                "renderer.</b>"
+            ))
+            print(f"{type(exc).__name__}: {exc}")
+            figure.show(renderer="colab")
+            return
+    display(figure)
+
 
 cache = load_feature_cache()
 index = cache.index.copy()
@@ -677,7 +714,7 @@ def render_matrix(*_):
             template="plotly_white",
             height=620,
         )
-        display(heat)
+        display_widget_figure(heat)
 
         error = go.Figure()
         error.add_trace(go.Bar(
@@ -697,7 +734,7 @@ def render_matrix(*_):
             yaxis_title="Mean across cells",
             template="plotly_white",
         )
-        display(error)
+        display_widget_figure(error)
 
         effect_table = pd.DataFrame({
             "cell_id": matrix.cell_ids,
@@ -715,7 +752,7 @@ def render_matrix(*_):
             title="Per-cell standardized late-hit − miss effect",
             template="plotly_white",
         )
-        display(effect_figure)
+        display_widget_figure(effect_figure)
         distribution = pd.DataFrame({
             "population_response": population,
             "outcome": trial_outcome,
@@ -730,7 +767,7 @@ def render_matrix(*_):
             title="Trial-level population-response distributions",
             template="plotly_white",
         )
-        display(distribution_figure)
+        display_widget_figure(distribution_figure)
 
         comparisons = [
             ("events_baselined_post", "dff_baselined_post"),
@@ -753,7 +790,7 @@ def render_matrix(*_):
         compare.update_layout(
             title="Representation comparisons", template="plotly_white"
         )
-        display(compare)
+        display_widget_figure(compare)
 
 
 geometry_color_dd = widgets.Dropdown(
@@ -797,7 +834,7 @@ def render_geometry(*_):
             title=f"Trial geometry · {FEATURE_LABELS[feature_dd.value]}",
             template="plotly_white",
         )
-        display(geometry_figure)
+        display_widget_figure(geometry_figure)
         scree_figure = px.bar(
             x=np.arange(1, n_components + 1),
             y=pca.explained_variance_ratio_,
@@ -805,7 +842,7 @@ def render_geometry(*_):
             title="PCA scree plot",
             template="plotly_white",
         )
-        display(scree_figure)
+        display_widget_figure(scree_figure)
         covariates = [
             ("pre_change_pupil", "Pre-change pupil"),
             ("pre_change_running", "Pre-change running"),
@@ -827,7 +864,7 @@ def render_geometry(*_):
             title="Behavior–neural relationships (no imputation)",
             template="plotly_white",
         )
-        display(relation)
+        display_widget_figure(relation)
         missing = (
             q2.isna().mean().sort_values(ascending=False).rename("missing_fraction")
             .reset_index().rename(columns={"index": "covariate"})
@@ -840,7 +877,7 @@ def render_geometry(*_):
             title="Q2 covariate missingness",
             template="plotly_white",
         )
-        display(missingness_figure)
+        display_widget_figure(missingness_figure)
 
 
 decoder_feature_dd = widgets.Dropdown(
@@ -936,7 +973,7 @@ def render_decoder(_=None):
             template="plotly_white",
         )
         auc_figure.add_hline(y=0.5, line_dash="dash")
-        display(auc_figure)
+        display_widget_figure(auc_figure)
 
         fpr, tpr, _ = roc_curve(result.oof.y, result.oof.mean_score)
         roc = go.Figure(go.Scatter(x=fpr, y=tpr, mode="lines", name="Mean OOF score"))
@@ -950,7 +987,7 @@ def render_decoder(_=None):
             yaxis_title="True-positive rate",
             template="plotly_white",
         )
-        display(roc)
+        display_widget_figure(roc)
 
         fold = result.fold_metrics[result.fold_metrics.seed.eq(0)].melt(
             id_vars=["fold"],
@@ -963,7 +1000,7 @@ def render_decoder(_=None):
             title="Seed 0 temporal test-fold support",
             template="plotly_white",
         )
-        display(fold_figure)
+        display_widget_figure(fold_figure)
         temporal = result.oof.sort_values("trial_index")
         temporal_figure = px.scatter(
             temporal,
@@ -974,7 +1011,7 @@ def render_decoder(_=None):
             title="OOF decision score over raw trial order",
             template="plotly_white",
         )
-        display(temporal_figure)
+        display_widget_figure(temporal_figure)
         cells = result.cell_summary[
             result.cell_summary.selection_frequency.gt(0)
         ].sort_values(
@@ -992,7 +1029,7 @@ def render_decoder(_=None):
             title="Cell selection frequency and standardized coefficients",
             template="plotly_white",
         )
-        display(cell_figure)
+        display_widget_figure(cell_figure)
 
 
 # Establish a complete initial selection before registering observers. This
@@ -1088,7 +1125,7 @@ neural_notebook = notebook([
         """
     ),
     markdown("## 0. Prepare the Colab runtime"),
-    code(DEPENDENCY_SETUP),
+    code(NEURAL_DEPENDENCY_SETUP),
     markdown("## 1. Verified release loader\n\nEmbedded for one-file Colab use."),
     code(RELEASE_SOURCE, hidden=True),
     markdown("## 2. Typed single-experiment decoder\n\nEmbedded for one-file Colab use."),

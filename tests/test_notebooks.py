@@ -38,7 +38,10 @@ def test_behavior_notebook_uses_only_compact_scan():
 
 
 def test_neural_notebook_contains_visual_and_decoder_contracts():
+    document = json.loads(NOTEBOOKS[1].read_text())
     text = NOTEBOOKS[1].read_text()
+    setup = "".join(document["cells"][2]["source"])
+    final_cell = "".join(document["cells"][-1]["source"])
     assert "neural-dev-features-v1-29482249873" in text
     assert "Trial × cell response matrix" in text
     assert "Representation comparisons" in text
@@ -49,6 +52,9 @@ def test_neural_notebook_contains_visual_and_decoder_contracts():
     assert "Blocked + purge · registered" in text
     assert "EXPLORATORY" in text
     assert "reset_index(names=" not in text
+    assert 'kaleido==0.2.1' in setup
+    assert "display_widget_figure" in final_cell
+    assert "figure.to_image" not in final_cell
 
 
 def test_neural_widget_initialization_avoids_colab_output_races():
