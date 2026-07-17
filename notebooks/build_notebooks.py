@@ -105,22 +105,11 @@ for _, _, distribution in requirements:
 print("Runtime versions:", versions)
 """
 
-NEURAL_DEPENDENCY_SETUP = DEPENDENCY_SETUP + r"""
-
-# Plotly's JavaScript renderer is unreliable when nested inside
-# ipywidgets.Output/Tab in Colab. Kaleido provides a PNG renderer for those
-# panels while the surrounding selectors and buttons remain interactive.
-google_package = find_spec("google")
-in_colab_runtime = (
-    "google.colab" in sys.modules
-    or (google_package is not None and find_spec("google.colab") is not None)
+NEURAL_DEPENDENCY_SETUP = DEPENDENCY_SETUP.replace(
+    '    ("plotly", "plotly", "plotly"),\n',
+    '    ("matplotlib", "matplotlib", "matplotlib"),\n'
+    '    ("seaborn", "seaborn", "seaborn"),\n',
 )
-if in_colab_runtime and find_spec("kaleido") is None:
-    print("Installing the Colab-safe Plotly image renderer: kaleido==0.2.1")
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install", "--quiet", "kaleido==0.2.1"
-    ])
-"""
 
 
 BEHAVIOR_LOAD = r"""
@@ -424,20 +413,18 @@ display(widgets.VBox([
 
 
 NEURAL_LOAD = r"""
+from contextlib import nullcontext
 from functools import lru_cache
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import seaborn as sns
 import ipywidgets as widgets
-from IPython.display import HTML, Image, clear_output, display
+from IPython.display import HTML, display
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_curve
 from sklearn.preprocessing import StandardScaler
-
-IN_COLAB = "google.colab" in sys.modules
 
 try:
     from google.colab import output as colab_output
@@ -445,22 +432,17 @@ try:
 except ImportError:
     pass
 
+sns.set_theme(style="whitegrid", context="notebook")
 
-def display_widget_figure(figure):
-    # Render reliably inside nested Colab widgets.
-    if IN_COLAB:
-        try:
-            display(Image(figure.to_image(format="png", scale=1.25)))
-            return
-        except Exception as exc:
-            display(HTML(
-                "<b>Static rendering failed; trying Colab's interactive "
-                "renderer.</b>"
-            ))
-            print(f"{type(exc).__name__}: {exc}")
-            figure.show(renderer="colab")
-            return
+
+def display_matplotlib_figure(figure):
+    # Emit a native PNG payload that is reliable inside Colab Output widgets.
+    try:
+        figure.tight_layout()
+    except Exception:
+        pass
     display(figure)
+    plt.close(figure)
 
 
 cache = load_feature_cache()
@@ -517,40 +499,74 @@ metric_cards([
     ("Cells per experiment", f"{index.n_cells.min()}–{index.n_cells.max()}"),
 ])
 
-px.scatter(
-    index,
+figure, axis = plt.subplots(figsize=(11, 6))
+sns.scatterplot(
+    data=index,
     x="n_trials",
     y="n_cells",
-    color="project_code",
-    symbol="session_type",
+    hue="project_code",
+    style="session_type",
     size="n_cells",
-    hover_data=["ophys_experiment_id", "ophys_container_id", "mouse_id"],
+    sizes=(70, 360),
+    alpha=0.8,
+    ax=axis,
+)
+axis.set(
     title="Feature-cache coverage",
-    template="plotly_white",
-).show()
+    xlabel="Aligned trials",
+    ylabel="Cells",
+)
+axis.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+display_matplotlib_figure(figure)
 
-hierarchy = index.copy()
-for column in ["mouse_id", "ophys_container_id", "ophys_experiment_id"]:
-    hierarchy[column] = hierarchy[column].astype(str)
-px.sunburst(
-    hierarchy,
-    path=["mouse_id", "ophys_container_id", "ophys_experiment_id"],
-    values="n_trials",
-    color="session_type",
-    title="Mouse → container → experiment hierarchy (area = trials)",
-).show()
+hierarchy = index.sort_values(
+    ["mouse_id", "ophys_container_id", "ophys_experiment_id"]
+).copy()
+hierarchy["row_label"] = (
+    hierarchy.mouse_id.astype(str)
+    + " / "
+    + hierarchy.ophys_container_id.astype(str)
+)
+hierarchy["experiment_order"] = (
+    hierarchy.groupby(["mouse_id", "ophys_container_id"]).cumcount() + 1
+)
+figure, axis = plt.subplots(figsize=(12, 7))
+sns.scatterplot(
+    data=hierarchy,
+    x="experiment_order",
+    y="row_label",
+    hue="session_type",
+    style="session_type",
+    size="n_trials",
+    sizes=(80, 360),
+    alpha=0.85,
+    ax=axis,
+)
+axis.set(
+    title="Mouse → container → experiment hierarchy (size = trials)",
+    xlabel="Experiment order within container",
+    ylabel="Mouse / container",
+)
+axis.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+display_matplotlib_figure(figure)
 
 coverage = pd.crosstab(index.mouse_id.astype(str), index.session_type)
-fig = px.imshow(
+figure, axis = plt.subplots(figsize=(12, 5))
+sns.heatmap(
     coverage,
-    text_auto=True,
-    aspect="auto",
-    color_continuous_scale="Teal",
-    labels={"x": "Session type", "y": "Mouse", "color": "Experiments"},
-    title="Session-type coverage by mouse",
+    annot=True,
+    fmt="d",
+    cmap="crest",
+    linewidths=0.5,
+    cbar_kws={"label": "Experiments"},
+    ax=axis,
 )
-fig.update_layout(template="plotly_white")
-fig.show()
+axis.set(
+    title="Session-type coverage by mouse",
+    xlabel="Session type",
+    ylabel="Mouse",
+)
+display_matplotlib_figure(figure)
 """
 
 
@@ -670,7 +686,7 @@ def bootstrap_population(frame, groups, n_boot=500):
     return pd.DataFrame(rows)
 
 
-def render_matrix(*_):
+def render_matrix(*_, direct=False):
     if experiment_dd.value is None:
         return
     oeid = int(experiment_dd.value)
@@ -692,49 +708,62 @@ def render_matrix(*_):
         shown = np.divide(shown - mean, sd, out=np.zeros_like(shown), where=sd > 0)
     population = np.nanmean(values, axis=1)
     summary = bootstrap_population(population, trial_outcome)
-    matrix_out.outputs = ()
-    with matrix_out:
+    if not direct:
+        matrix_out.outputs = ()
+    with (nullcontext() if direct else matrix_out):
         display(HTML(
             f"<h3>Experiment {oeid}</h3><p>{FEATURE_LABELS[feature_dd.value]} · "
             f"{len(values):,} trials × {values.shape[1]:,} cells. "
             f"Heatmap shows the top {len(order)} cells.</p>"
         ))
-        heat = go.Figure(go.Heatmap(
-            z=shown,
-            x=[str(int(matrix.cell_ids[i])) for i in order],
-            y=labels.trial_index.to_numpy()[trial_order],
-            colorscale="RdBu_r",
-            zmid=0,
-            colorbar={"title": "z" if scale_dd.value == "z" else "response"},
-        ))
-        heat.update_layout(
-            title="Trial × cell response matrix",
-            xaxis_title="Cell specimen ID",
-            yaxis_title="Raw trial index (grouped by outcome)",
-            template="plotly_white",
-            height=620,
+        heat_frame = pd.DataFrame(
+            shown,
+            index=labels.trial_index.to_numpy()[trial_order],
+            columns=[str(int(matrix.cell_ids[i])) for i in order],
         )
-        display_widget_figure(heat)
-
-        error = go.Figure()
-        error.add_trace(go.Bar(
-            x=summary.outcome,
-            y=summary["mean"],
-            error_y={
-                "type": "data",
-                "symmetric": False,
-                "array": summary.high - summary["mean"],
-                "arrayminus": summary["mean"] - summary.low,
+        figure, axis = plt.subplots(figsize=(15, 8))
+        sns.heatmap(
+            heat_frame,
+            cmap="vlag",
+            center=0,
+            xticklabels=max(1, len(order) // 20),
+            yticklabels=max(1, len(heat_frame) // 25),
+            cbar_kws={
+                "label": "Cell z-score" if scale_dd.value == "z" else "Response"
             },
-            customdata=summary[["n"]],
-            hovertemplate="%{x}<br>mean=%{y:.3f}<br>n=%{customdata[0]}<extra></extra>",
-        ))
-        error.update_layout(
-            title="Population response by outcome (bootstrap 95% CI)",
-            yaxis_title="Mean across cells",
-            template="plotly_white",
+            ax=axis,
         )
-        display_widget_figure(error)
+        axis.set(
+            title="Trial × cell response matrix",
+            xlabel="Cell specimen ID",
+            ylabel="Raw trial index (grouped by outcome)",
+        )
+        display_matplotlib_figure(figure)
+
+        figure, axis = plt.subplots(figsize=(9, 5))
+        lower = summary["mean"] - summary.low
+        upper = summary.high - summary["mean"]
+        axis.bar(
+            summary.outcome,
+            summary["mean"],
+            yerr=np.vstack([lower, upper]),
+            color=sns.color_palette("deep", len(summary)),
+            capsize=4,
+        )
+        for position, row in enumerate(summary.itertuples()):
+            axis.annotate(
+                f"n={row.n}",
+                (position, row.high),
+                xytext=(0, 6),
+                textcoords="offset points",
+                ha="center",
+            )
+        axis.set(
+            title="Population response by outcome (bootstrap 95% CI)",
+            xlabel="Outcome",
+            ylabel="Mean across cells",
+        )
+        display_matplotlib_figure(figure)
 
         effect_table = pd.DataFrame({
             "cell_id": matrix.cell_ids,
@@ -742,55 +771,64 @@ def render_matrix(*_):
             "variance": np.nanvar(values, axis=0),
         }).sort_values("effect")
         effect_table["rank"] = np.arange(len(effect_table))
-        effect_figure = px.scatter(
-            effect_table,
-            x="rank",
-            y="effect",
-            color="variance",
-            hover_data=["cell_id"],
-            color_continuous_scale="Viridis",
-            title="Per-cell standardized late-hit − miss effect",
-            template="plotly_white",
+        figure, axis = plt.subplots(figsize=(11, 5))
+        points = axis.scatter(
+            effect_table["rank"],
+            effect_table["effect"],
+            c=effect_table["variance"],
+            cmap="viridis",
+            s=28,
+            alpha=0.8,
         )
-        display_widget_figure(effect_figure)
+        figure.colorbar(points, ax=axis, label="Variance")
+        axis.axhline(0, color="0.45", linewidth=1)
+        axis.set(
+            title="Per-cell standardized late-hit − miss effect",
+            xlabel="Effect rank",
+            ylabel="Standardized effect",
+        )
+        display_matplotlib_figure(figure)
+
         distribution = pd.DataFrame({
             "population_response": population,
             "outcome": trial_outcome,
         })
-        distribution_figure = px.violin(
-            distribution,
+        figure, axis = plt.subplots(figsize=(9, 5))
+        sns.violinplot(
+            data=distribution,
             x="outcome",
             y="population_response",
-            color="outcome",
-            box=True,
-            points="outliers",
-            title="Trial-level population-response distributions",
-            template="plotly_white",
+            hue="outcome",
+            inner="box",
+            cut=0,
+            legend=False,
+            ax=axis,
         )
-        display_widget_figure(distribution_figure)
+        axis.set(
+            title="Trial-level population-response distributions",
+            xlabel="Outcome",
+            ylabel="Population response",
+        )
+        display_matplotlib_figure(figure)
 
         comparisons = [
             ("events_baselined_post", "dff_baselined_post"),
             ("events_unbaselined_pre", "events_unbaselined_post"),
         ]
-        compare = make_subplots(rows=1, cols=2, subplot_titles=[
-            "Events post vs dF/F post", "Events pre vs events post"
-        ])
-        for col, (left_name, right_name) in enumerate(comparisons, start=1):
+        titles = ["Events post vs dF/F post", "Events pre vs events post"]
+        figure, axes = plt.subplots(1, 2, figsize=(13, 5))
+        for axis, title, (left_name, right_name) in zip(axes, titles, comparisons):
             left = experiment_data(oeid, left_name)[0].values.mean(axis=1)
             right = experiment_data(oeid, right_name)[0].values.mean(axis=1)
             correlation = np.corrcoef(left, right)[0, 1]
-            compare.add_trace(go.Scatter(
-                x=left, y=right, mode="markers",
-                marker={"size": 5, "opacity": 0.55},
-                name=f"r={correlation:.2f}", showlegend=True,
-            ), row=1, col=col)
-        compare.update_xaxes(title_text="Left population response")
-        compare.update_yaxes(title_text="Right population response")
-        compare.update_layout(
-            title="Representation comparisons", template="plotly_white"
-        )
-        display_widget_figure(compare)
+            sns.scatterplot(x=left, y=right, s=25, alpha=0.55, ax=axis)
+            axis.set(
+                title=f"{title} · r={correlation:.2f}",
+                xlabel="Left population response",
+                ylabel="Right population response",
+            )
+        figure.suptitle("Representation comparisons")
+        display_matplotlib_figure(figure)
 
 
 geometry_color_dd = widgets.Dropdown(
@@ -799,7 +837,7 @@ geometry_color_dd = widgets.Dropdown(
 )
 
 
-def render_geometry(*_):
+def render_geometry(*_, direct=False):
     if experiment_dd.value is None:
         return
     oeid = int(experiment_dd.value)
@@ -807,8 +845,9 @@ def render_geometry(*_):
     values = matrix.values.astype(float)
     finite = np.isfinite(values).all(axis=1)
     if finite.sum() < 3:
-        geometry_out.outputs = ()
-        with geometry_out:
+        if not direct:
+            geometry_out.outputs = ()
+        with (nullcontext() if direct else geometry_out):
             print("PCA nonestimable: fewer than three finite trials.")
         return
     scaled = StandardScaler().fit_transform(values[finite])
@@ -823,61 +862,78 @@ def render_geometry(*_):
     joint = q2.copy()
     joint["population_response"] = population
     joint["outcome"] = outcome_labels(labels)
-    geometry_out.outputs = ()
-    with geometry_out:
-        geometry_figure = px.scatter(
-            plot,
+    if not direct:
+        geometry_out.outputs = ()
+    with (nullcontext() if direct else geometry_out):
+        figure, axis = plt.subplots(figsize=(9, 6))
+        color_column = geometry_color_dd.value
+        sns.scatterplot(
+            data=plot,
             x="PC1",
             y="PC2",
-            color=geometry_color_dd.value,
-            hover_data=["outcome", "engaged_B", "session_position"],
-            title=f"Trial geometry · {FEATURE_LABELS[feature_dd.value]}",
-            template="plotly_white",
+            hue=color_column,
+            palette="viridis" if color_column == "session_position" else "deep",
+            s=42,
+            alpha=0.75,
+            ax=axis,
         )
-        display_widget_figure(geometry_figure)
-        scree_figure = px.bar(
+        axis.set_title(f"Trial geometry · {FEATURE_LABELS[feature_dd.value]}")
+        axis.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+        display_matplotlib_figure(figure)
+
+        figure, axis = plt.subplots(figsize=(9, 5))
+        sns.barplot(
             x=np.arange(1, n_components + 1),
             y=pca.explained_variance_ratio_,
-            labels={"x": "Principal component", "y": "Explained variance ratio"},
-            title="PCA scree plot",
-            template="plotly_white",
+            color=sns.color_palette()[0],
+            ax=axis,
         )
-        display_widget_figure(scree_figure)
+        axis.set(
+            title="PCA scree plot",
+            xlabel="Principal component",
+            ylabel="Explained variance ratio",
+        )
+        display_matplotlib_figure(figure)
+
         covariates = [
             ("pre_change_pupil", "Pre-change pupil"),
             ("pre_change_running", "Pre-change running"),
             ("session_position", "Session position"),
         ]
-        relation = make_subplots(rows=1, cols=3, subplot_titles=[label for _, label in covariates])
-        for col, (name, _) in enumerate(covariates, start=1):
+        figure, axes = plt.subplots(1, 3, figsize=(15, 5))
+        for axis, (name, label_text) in zip(axes, covariates):
             good = joint[name].notna() & joint.population_response.notna()
-            relation.add_trace(go.Scatter(
-                x=joint.loc[good, name],
-                y=joint.loc[good, "population_response"],
-                mode="markers",
-                marker={"size": 5, "opacity": 0.5},
-                text=joint.loc[good, "outcome"],
-                showlegend=False,
-            ), row=1, col=col)
-        relation.update_yaxes(title_text="Population response", row=1, col=1)
-        relation.update_layout(
-            title="Behavior–neural relationships (no imputation)",
-            template="plotly_white",
-        )
-        display_widget_figure(relation)
+            sns.regplot(
+                data=joint.loc[good],
+                x=name,
+                y="population_response",
+                scatter_kws={"s": 18, "alpha": 0.45},
+                line_kws={"color": "#c44e52"},
+                ax=axis,
+            )
+            axis.set_title(label_text)
+        figure.suptitle("Behavior–neural relationships (no imputation)")
+        display_matplotlib_figure(figure)
+
         missing = (
             q2.isna().mean().sort_values(ascending=False).rename("missing_fraction")
             .reset_index().rename(columns={"index": "covariate"})
         )
-        missingness_figure = px.bar(
-            missing,
+        figure_height = max(5, 0.3 * len(missing))
+        figure, axis = plt.subplots(figsize=(10, figure_height))
+        sns.barplot(
+            data=missing,
             x="missing_fraction",
             y="covariate",
-            orientation="h",
-            title="Q2 covariate missingness",
-            template="plotly_white",
+            color=sns.color_palette()[0],
+            ax=axis,
         )
-        display_widget_figure(missingness_figure)
+        axis.set(
+            title="Q2 covariate missingness",
+            xlabel="Missing fraction",
+            ylabel="Covariate",
+        )
+        display_matplotlib_figure(figure)
 
 
 decoder_feature_dd = widgets.Dropdown(
@@ -964,72 +1020,119 @@ def render_decoder(_=None):
             f"<p>{len(result.oof):,} registered eligible trials · "
             f"{len(result.seed_metrics):,} deterministic seeds.</p>"
         ))
-        auc_figure = px.bar(
-            result.seed_metrics,
+        figure, axis = plt.subplots(figsize=(9, 5))
+        sns.barplot(
+            data=result.seed_metrics,
             x="seed",
             y="auc",
-            range_y=[0, 1],
-            title="Seed-level OOF AUC",
-            template="plotly_white",
+            color=sns.color_palette()[0],
+            ax=axis,
         )
-        auc_figure.add_hline(y=0.5, line_dash="dash")
-        display_widget_figure(auc_figure)
+        axis.axhline(0.5, linestyle="--", color="0.4")
+        axis.set(
+            title="Seed-level OOF AUC",
+            xlabel="Seed",
+            ylabel="OOF AUC",
+            ylim=(0, 1),
+        )
+        display_matplotlib_figure(figure)
 
         fpr, tpr, _ = roc_curve(result.oof.y, result.oof.mean_score)
-        roc = go.Figure(go.Scatter(x=fpr, y=tpr, mode="lines", name="Mean OOF score"))
-        roc.add_trace(go.Scatter(
-            x=[0, 1], y=[0, 1], mode="lines",
-            line={"dash": "dash", "color": "#6b7280"}, name="Chance",
-        ))
-        roc.update_layout(
+        figure, axis = plt.subplots(figsize=(7, 6))
+        axis.plot(fpr, tpr, linewidth=2, label="Mean OOF score")
+        axis.plot([0, 1], [0, 1], linestyle="--", color="0.5", label="Chance")
+        axis.set(
             title="OOF ROC across mean seed scores",
-            xaxis_title="False-positive rate",
-            yaxis_title="True-positive rate",
-            template="plotly_white",
+            xlabel="False-positive rate",
+            ylabel="True-positive rate",
+            xlim=(0, 1),
+            ylim=(0, 1),
         )
-        display_widget_figure(roc)
+        axis.legend(frameon=False)
+        display_matplotlib_figure(figure)
 
-        fold = result.fold_metrics[result.fold_metrics.seed.eq(0)].melt(
-            id_vars=["fold"],
-            value_vars=["test_negative", "test_positive"],
-            var_name="class",
-            value_name="trials",
+        fold = result.fold_metrics[
+            result.fold_metrics.seed.eq(0)
+        ].sort_values("fold")
+        figure, axis = plt.subplots(figsize=(9, 5))
+        axis.bar(
+            fold.fold,
+            fold.test_negative,
+            label="miss",
+            color=sns.color_palette("deep")[0],
         )
-        fold_figure = px.bar(
-            fold, x="fold", y="trials", color="class", barmode="stack",
+        axis.bar(
+            fold.fold,
+            fold.test_positive,
+            bottom=fold.test_negative,
+            label="late hit",
+            color=sns.color_palette("deep")[1],
+        )
+        axis.set(
             title="Seed 0 temporal test-fold support",
-            template="plotly_white",
+            xlabel="Fold",
+            ylabel="Trials",
         )
-        display_widget_figure(fold_figure)
-        temporal = result.oof.sort_values("trial_index")
-        temporal_figure = px.scatter(
-            temporal,
+        axis.legend(frameon=False)
+        display_matplotlib_figure(figure)
+
+        temporal = result.oof.sort_values("trial_index").copy()
+        temporal["outcome"] = temporal.y.map({0: "miss", 1: "late hit"})
+        figure, axis = plt.subplots(figsize=(12, 5))
+        sns.scatterplot(
+            data=temporal,
             x="trial_index",
             y="mean_score",
-            color=temporal.y.map({0: "miss", 1: "late hit"}),
-            labels={"color": "Outcome"},
-            title="OOF decision score over raw trial order",
-            template="plotly_white",
+            hue="outcome",
+            style="outcome",
+            s=32,
+            alpha=0.75,
+            ax=axis,
         )
-        display_widget_figure(temporal_figure)
+        axis.axhline(0.5, linestyle="--", color="0.5")
+        axis.set(
+            title="OOF decision score over raw trial order",
+            xlabel="Raw trial index",
+            ylabel="Mean OOF score",
+        )
+        axis.legend(frameon=False)
+        display_matplotlib_figure(figure)
+
         cells = result.cell_summary[
             result.cell_summary.selection_frequency.gt(0)
         ].sort_values(
             ["selection_frequency", "mean_abs_coefficient"], ascending=False
         ).head(60)
-        cell_figure = px.scatter(
-            cells,
+        figure, axis = plt.subplots(figsize=(10, 6))
+        max_abs = max(float(cells.median_coefficient.abs().max()), 1e-12)
+        sns.scatterplot(
+            data=cells,
             x="selection_frequency",
             y="median_coefficient",
             size="mean_abs_coefficient",
-            color="median_coefficient",
-            hover_data=["cell_id"],
-            color_continuous_scale="RdBu_r",
-            color_continuous_midpoint=0,
-            title="Cell selection frequency and standardized coefficients",
-            template="plotly_white",
+            hue="median_coefficient",
+            palette="vlag",
+            hue_norm=(-max_abs, max_abs),
+            sizes=(40, 320),
+            alpha=0.8,
+            ax=axis,
         )
-        display_widget_figure(cell_figure)
+        for row in cells.head(10).itertuples():
+            axis.annotate(
+                str(int(row.cell_id)),
+                (row.selection_frequency, row.median_coefficient),
+                xytext=(4, 4),
+                textcoords="offset points",
+                fontsize=8,
+            )
+        axis.axhline(0, color="0.45", linewidth=1)
+        axis.set(
+            title="Cell selection frequency and standardized coefficients",
+            xlabel="Selection frequency",
+            ylabel="Median standardized coefficient",
+        )
+        axis.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+        display_matplotlib_figure(figure)
 
 
 # Establish a complete initial selection before registering observers. This
@@ -1076,9 +1179,11 @@ display(widgets.VBox([
     tabs,
 ]))
 
-# Render once, after the Output widgets are attached to Colab's widget tree.
-render_matrix()
-render_geometry()
+# The first render is emitted directly by the cell as native image/png. This
+# avoids relying on nested widget-output capture during Colab's initial mount.
+# Later selector changes render into the Output panels above.
+render_matrix(direct=True)
+render_geometry(direct=True)
 """
 
 

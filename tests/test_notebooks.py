@@ -52,9 +52,13 @@ def test_neural_notebook_contains_visual_and_decoder_contracts():
     assert "Blocked + purge · registered" in text
     assert "EXPLORATORY" in text
     assert "reset_index(names=" not in text
-    assert 'kaleido==0.2.1' in setup
-    assert "display_widget_figure" in final_cell
-    assert "figure.to_image" not in final_cell
+    assert '("matplotlib", "matplotlib", "matplotlib")' in setup
+    assert '("seaborn", "seaborn", "seaborn")' in setup
+    assert '("plotly", "plotly", "plotly")' not in setup
+    assert "display_matplotlib_figure" in final_cell
+    assert "px." not in final_cell
+    assert "go." not in final_cell
+    assert "kaleido" not in text
 
 
 def test_neural_widget_initialization_avoids_colab_output_races():
@@ -63,6 +67,11 @@ def test_neural_widget_initialization_avoids_colab_output_races():
     assert source.index("sync_containers()") < source.index(
         'mouse_dd.observe(sync_containers, names="value")'
     )
-    assert source.index("display(widgets.VBox") < source.rindex("render_matrix()")
+    assert source.index("display(widgets.VBox") < source.rindex(
+        "render_matrix(direct=True)"
+    )
+    assert source.rindex("render_matrix(direct=True)") < source.rindex(
+        "render_geometry(direct=True)"
+    )
     assert "matrix_out.clear_output" not in source
     assert "geometry_out.clear_output" not in source

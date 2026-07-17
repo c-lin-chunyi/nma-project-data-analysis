@@ -11,6 +11,8 @@ nbformat = pytest.importorskip("nbformat")
 pytest.importorskip("nbclient")
 pytest.importorskip("plotly")
 pytest.importorskip("ipywidgets")
+pytest.importorskip("matplotlib")
+pytest.importorskip("seaborn")
 
 from nbclient import NotebookClient
 
@@ -47,3 +49,13 @@ def test_notebook_executes_with_local_release_fixture(
         resources={"metadata": {"path": str(ROOT)}},
     )
     client.execute()
+    if name == "02_neural_feature_explorer.ipynb":
+        final_code_cell = [
+            cell for cell in document.cells if cell.cell_type == "code"
+        ][-1]
+        png_outputs = [
+            output
+            for output in final_code_cell.get("outputs", [])
+            if "image/png" in output.get("data", {})
+        ]
+        assert len(png_outputs) >= 2
