@@ -1,0 +1,245 @@
+name: publish neural DEV feature cache
+
+run-name: neural feature cache · ${{ inputs.neural_data_release }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      behavioral_release:
+        description: 'Exact behavioral-v3.1-* Release tag used by the neural package'
+        required: true
+        type: string
+      neural_data_release:
+        description: 'Exact neural-dev-data-* immutable 70-bundle Release tag'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: neural-feature-cache-${{ inputs.neural_data_release }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: 1
+  PIP_DISABLE_PIP_VERSION_CHECK: 1
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pinned pipeline
+        run: python -m pip install -r requirements-pipeline.txt
+      - name: Resolve immutable sources and draft cache Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATA_TAG: ${{ inputs.neural_data_release }}
+          BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          set -euo pipefail
+          case "$DATA_TAG" in neural-dev-data-[0-9]*) ;; *) echo "::error::exact neural-dev-data-* tag required"; exit 1;; esac
+          case "$BEHAVIOR_TAG" in behavioral-v3.1-*) ;; *) echo "::error::exact behavioral-v3.1-* tag required"; exit 1;; esac
+          suffix=${DATA_TAG#neural-dev-data-}
+          case "$suffix" in *[!0-9]*|'') echo "::error::neural data tag must end in its numeric source run"; exit 1;; esac
+          feature_tag="neural-dev-features-v1-${suffix}"
+          test "$(gh release view "$DATA_TAG" --json isDraft --jq .isDraft)" = false
+          mkdir -p run/data-source run/behavior-source run/behavior run/neural \
+            run/features run/packages run/cache-assets run/all-features assets
+          for asset in SHA256SUMS bundle-files.sha256 data-package-manifest.json \
+                       dev_experiments.csv behavioral-manifest.json neural-data-provenance.json; do
+            gh release download "$DATA_TAG" -p "$asset" -D run/data-source
+          done
+          (cd run/data-source && \
+            grep -E '  (bundle-files.sha256|data-package-manifest.json|dev_experiments.csv|behavioral-manifest.json|neural-data-provenance.json)$' SHA256SUMS | sha256sum --check -)
+          gh release download "$BEHAVIOR_TAG" -p SHA256SUMS -p behavioral-v3.1-scan.tar.gz \
+            -p behavioral-manifest.json -D run/behavior-source
+          (cd run/behavior-source && \
+            grep -E '  (behavioral-v3.1-scan.tar.gz|behavioral-manifest.json)$' SHA256SUMS | sha256sum --check -)
+          tar -xzf run/behavior-source/behavioral-v3.1-scan.tar.gz -C run/behavior
+          cmp run/data-source/behavioral-manifest.json run/behavior-source/behavioral-manifest.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import pandas as pd
+          source=json.loads(Path('run/data-source/data-package-manifest.json').read_text())
+          table=pd.read_csv('run/data-source/dev_experiments.csv')
+          assert source['schema']=='neural-dev-data-v1'
+          assert source['n_experiments']==70 and source['n_containers']==10
+          assert source['behavioral_release']==os.environ['BEHAVIOR_TAG']
+          assert source['allen_nwb_download'] is False
+          assert len(table)==70 and table.ophys_experiment_id.astype(int).nunique()==70
+          assert table.ophys_container_id.astype(int).nunique()==10
+          assert int(table.role.eq('active').sum())==50 and int(table.role.eq('passive').sum())==20
+          PY
+          data_manifest_sha=$(sha256sum run/data-source/data-package-manifest.json | cut -d' ' -f1)
+          printf 'FEATURE_TAG=%s\nDATA_MANIFEST_SHA=%s\n' "$feature_tag" "$data_manifest_sha" >> "$GITHUB_ENV"
+          if gh release view "$feature_tag" >/dev/null 2>&1; then
+            test "$(gh release view "$feature_tag" --json isDraft --jq .isDraft)" = true || {
+              echo "::error::$feature_tag is already public and immutable"; exit 1;
+            }
+            target=$(gh release view "$feature_tag" --json targetCommitish --jq .targetCommitish)
+            test "$target" = "$GITHUB_SHA" || {
+              echo "::error::draft $feature_tag belongs to commit $target, not $GITHUB_SHA; do not mix cache schemas"; exit 1;
+            }
+          else
+            printf '# Neural DEV analysis-ready feature cache v1\n\n- Neural source: `%s`\n- Behavioral source: `%s`\n- Code: `%s`\n- Allen NWB download: **false**\n\nThis active-only cache contains fold-independent registered-window matrices, not OOF predictions. The draft is published only after exact 50/50 validation.\n' \
+              "$DATA_TAG" "$BEHAVIOR_TAG" "$GITHUB_SHA" > release-notes.md
+            gh release create "$feature_tag" --target "$GITHUB_SHA" \
+              --title "$feature_tag: analysis-ready DEV features" \
+              --notes-file release-notes.md --latest=false --prerelease --draft
+          fi
+          echo 'analysis_only_materialization=true'
+          echo 'allen_nwb_download=false'
+      - name: Stream each source container once and upload resumable feature shards
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATA_TAG: ${{ inputs.neural_data_release }}
+          BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          set -euo pipefail
+          containers=$(python -c 'import pandas as pd; print(" ".join(map(str,sorted(pd.read_csv("run/data-source/dev_experiments.csv").ophys_container_id.astype(int).unique()))))')
+          for container in $containers; do
+            archive="feature-container-${container}.tar.gz"
+            checksum="${archive}.sha256"
+            assets=$(gh release view "$FEATURE_TAG" --json assets --jq '.assets[].name')
+            if grep -Fxq "$archive" <<<"$assets" && grep -Fxq "$checksum" <<<"$assets"; then
+              echo "reuse verified draft assets for container $container"
+              continue
+            fi
+            gh release delete-asset "$FEATURE_TAG" "$archive" -y >/dev/null 2>&1 || true
+            gh release delete-asset "$FEATURE_TAG" "$checksum" -y >/dev/null 2>&1 || true
+            rm -rf run/neural run/features run/packages
+            mkdir -p run/neural run/features run/packages
+            gh release download "$DATA_TAG" -p "neural-container-${container}.tar.part-*" -D run/packages
+            grep "  neural-container-${container}.tar.part-" run/data-source/SHA256SUMS > run/packages/part-checksums
+            (cd run/packages && sha256sum --check part-checksums)
+            cat run/packages/neural-container-${container}.tar.part-* | tar -xf - -C run/neural
+            python - "$container" <<'PY'
+          import pandas as pd, sys
+          from pathlib import Path
+          container=int(sys.argv[1])
+          table=pd.read_csv('run/data-source/dev_experiments.csv')
+          ids=set(table.loc[table.ophys_container_id.astype(int).eq(container),
+                            'ophys_experiment_id'].astype(int))
+          selected=[]
+          for line in Path('run/data-source/bundle-files.sha256').read_text().splitlines():
+              name=line.split(None,1)[1]
+              if int(name.split('.',1)[0]) in ids: selected.append(line)
+          if not selected: raise SystemExit(f'no bundle checksums for container {container}')
+          Path('run/packages/bundle-checksums').write_text('\n'.join(selected)+'\n')
+          PY
+            (cd run/neural && sha256sum --check ../packages/bundle-checksums)
+            python pipeline/verify-neural/neural.py features \
+              --manifest run/data-source/dev_experiments.csv --neural run/neural \
+              --behavior run/behavior --out run/features --container "$container" \
+              --data-release "$DATA_TAG" --data-manifest-sha256 "$DATA_MANIFEST_SHA" \
+              --behavioral-release "$BEHAVIOR_TAG"
+            tar -czf "run/cache-assets/$archive" -C run/features .
+            (cd run/cache-assets && sha256sum "$archive" > "$checksum")
+            gh release upload "$FEATURE_TAG" "run/cache-assets/$archive" \
+              "run/cache-assets/$checksum" --clobber
+            rm -rf run/neural run/features run/packages
+            mkdir -p run/neural run/features run/packages
+          done
+      - name: Rehydrate and strictly verify exact 50-experiment cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf run/all-features run/cache-download
+          mkdir -p run/all-features run/cache-download
+          containers=$(python -c 'import pandas as pd; print(" ".join(map(str,sorted(pd.read_csv("run/data-source/dev_experiments.csv").ophys_container_id.astype(int).unique()))))')
+          for container in $containers; do
+            archive="feature-container-${container}.tar.gz"
+            gh release download "$FEATURE_TAG" -p "$archive" -p "${archive}.sha256" -D run/cache-download
+            (cd run/cache-download && sha256sum --check "${archive}.sha256")
+            tar -xzf "run/cache-download/$archive" -C run/all-features
+          done
+          python pipeline/verify-neural/neural.py feature-verify \
+            --manifest run/data-source/dev_experiments.csv --features run/all-features \
+            --report run/feature-cache-validation.json
+          (cd run/all-features && find . -maxdepth 1 -type f -name '[0-9]*' -print0 | \
+            sort -z | xargs -0 sha256sum > ../feature-files.sha256)
+      - name: Publish cache manifests and make Release public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATA_TAG: ${{ inputs.neural_data_release }}
+          BEHAVIOR_TAG: ${{ inputs.behavioral_release }}
+        run: |
+          set -euo pipefail
+          python -m pip freeze > assets/feature-cache-environment.txt
+          sha256sum requirements-pipeline.txt > assets/environment-input.sha256
+          cp run/data-source/dev_experiments.csv run/data-source/data-package-manifest.json \
+            run/data-source/behavioral-manifest.json run/feature-files.sha256 \
+            run/feature-cache-validation.json prereg_v3.3.md assets/
+          python - <<'PY'
+          import datetime, hashlib, json, os, platform
+          from pathlib import Path
+          import pandas as pd
+          table=pd.read_csv('assets/dev_experiments.csv')
+          parts=[]
+          for checksum in sorted(Path('run/cache-download').glob('feature-container-*.tar.gz.sha256')):
+              digest,name=checksum.read_text().split()[:2]
+              path=Path('run/cache-download')/name
+              parts.append({'name':name,'sha256':digest,'size':path.stat().st_size})
+          manifest={
+              'schema':'neural-dev-feature-cache-v1',
+              'neural_data_release':os.environ['DATA_TAG'],
+              'data_manifest_sha256':os.environ['DATA_MANIFEST_SHA'],
+              'behavioral_release':os.environ['BEHAVIOR_TAG'],
+              'code_commit':os.environ['GITHUB_SHA'],
+              'n_active_experiments':int(table.role.eq('active').sum()),
+              'n_source_experiments':len(table),
+              'n_containers':int(table.ophys_container_id.nunique()),
+              'parts':parts,'feature_file_checksums':'feature-files.sha256',
+              'fold_independent':True,'contains_oof_predictions':False,
+              'analysis_only_materialization':True,'allen_nwb_download':False,
+          }
+          Path('assets/feature-cache-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          environment=Path('assets/feature-cache-environment.txt').read_bytes()
+          provenance={
+              'date_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'code_commit':os.environ['GITHUB_SHA'],'python':platform.python_version(),
+              'runner_os':os.environ.get('ImageOS',os.environ.get('RUNNER_OS')),
+              'runner_image_version':os.environ.get('ImageVersion'),
+              'workflow_run':f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'neural_data_release':os.environ['DATA_TAG'],
+              'data_manifest_sha256':os.environ['DATA_MANIFEST_SHA'],
+              'pip_freeze_sha256':hashlib.sha256(environment).hexdigest(),
+              'analysis_only_materialization':True,'allen_nwb_download':False,
+          }
+          Path('assets/feature-cache-provenance.json').write_text(json.dumps(provenance,indent=2)+'\n')
+          PY
+          : > assets/SHA256SUMS
+          for checksum in run/cache-download/feature-container-*.tar.gz.sha256; do
+            cat "$checksum" >> assets/SHA256SUMS
+          done
+          (cd assets && sha256sum feature-cache-manifest.json feature-cache-provenance.json \
+            feature-cache-environment.txt environment-input.sha256 feature-files.sha256 \
+            feature-cache-validation.json dev_experiments.csv data-package-manifest.json \
+            behavioral-manifest.json prereg_v3.3.md >> SHA256SUMS)
+          gh release upload "$FEATURE_TAG" assets/* --clobber
+          test "$(python -c 'import json; print(json.load(open("assets/feature-cache-manifest.json"))["n_active_experiments"])')" -eq 50
+          gh release edit "$FEATURE_TAG" --draft=false --prerelease --latest=false
+      - name: Upload feature-cache diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: neural-feature-cache-diagnostics
+          path: |
+            run/feature-cache-validation.json
+            run/all-features/_features-container-*.json
+            assets/feature-cache-manifest.json
+            assets/feature-cache-provenance.json
+            assets/SHA256SUMS
+          retention-days: 14
+          if-no-files-found: warn

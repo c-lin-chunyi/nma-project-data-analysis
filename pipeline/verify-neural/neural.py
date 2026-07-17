@@ -41,6 +41,18 @@ BUNDLE_SUFFIXES = (
     "q2.parquet", "meta.json",
 )
 
+FEATURE_CACHE_SCHEMA = "neural-dev-feature-cache-v1"
+FEATURE_CACHE_SUFFIXES = (
+    "features.h5", "labels.parquet", "q2.parquet", "feature-meta.json",
+)
+FEATURE_DATASETS = (
+    "events_baselined_post",
+    "events_unbaselined_pre",
+    "events_unbaselined_post",
+    "events_baselined_full_pre",
+    "dff_baselined_post",
+)
+
 
 def parse_shard(value: str) -> tuple[int, int]:
     try:
@@ -58,6 +70,15 @@ def bundle_paths(out: Path, oeid: int) -> list[Path]:
 
 def bundle_complete(out: Path, oeid: int) -> bool:
     return all(p.is_file() and p.stat().st_size > 0 for p in bundle_paths(out, oeid))
+
+
+def feature_cache_paths(out: Path, oeid: int) -> list[Path]:
+    return [out / f"{int(oeid)}.{suffix}" for suffix in FEATURE_CACHE_SUFFIXES]
+
+
+def feature_cache_complete(out: Path, oeid: int) -> bool:
+    return all(p.is_file() and p.stat().st_size > 0
+               for p in feature_cache_paths(out, oeid))
 
 
 def build_experiment_manifest(dev: pd.DataFrame, experiments: pd.DataFrame) -> pd.DataFrame:
@@ -436,6 +457,284 @@ def appendix_a_failures(root: Path, manifest: pd.DataFrame) -> list[dict]:
             failures.append({"ophys_experiment_id": oeid, "role": str(row.role),
                              "problems": problems})
     return failures
+
+
+def _json_scalar(value):
+    if value is None or (not isinstance(value, (list, dict)) and pd.isna(value)):
+        return None
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _write_feature_cache_experiment(source: Path, out: Path, row,
+                                    labels: pd.DataFrame, *, data_release: str,
+                                    data_manifest_sha256: str,
+                                    behavioral_release: str) -> None:
+    """Atomically materialize fold-independent active-session model matrices."""
+    import h5py
+    oeid, bsid = int(row.ophys_experiment_id), int(row.behavior_session_id)
+    staging = out / ".staging" / str(oeid)
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    try:
+        with h5py.File(source / f"{oeid}.neural.h5", "r") as h5:
+            if "trial_locked" not in h5:
+                raise ValueError(f"active experiment {oeid} lacks trial_locked arrays")
+            tl = h5["trial_locked"]
+            required = {"trial_id", "rel_time", "events_baselined",
+                        "events_unbaselined", "dff_baselined"}
+            missing = sorted(required - set(tl.keys()))
+            if missing:
+                raise ValueError(f"feature source {oeid} missing {missing}")
+            trial_ids = np.asarray(tl["trial_id"][:], dtype=np.int64)
+            rel = np.asarray(tl["rel_time"][:], dtype=float)
+            cells = np.asarray(h5["cell_specimen_id"][:], dtype=np.int64)
+            if not len(trial_ids) or len(np.unique(trial_ids)) != len(trial_ids):
+                raise ValueError(f"feature source {oeid} has empty/duplicate trial IDs")
+            if not len(cells) or len(np.unique(cells)) != len(cells):
+                raise ValueError(f"feature source {oeid} has empty/duplicate cell IDs")
+            masks = {
+                "post": (rel >= FIT_START) & (rel < FIT_END),
+                "pre": (rel >= PUPIL_START) & (rel < PUPIL_END),
+                "full_pre": rel < 0,
+            }
+            if not all(mask.any() for mask in masks.values()):
+                raise ValueError(f"feature source {oeid} has an empty registered window")
+            source_arrays = {
+                "events_baselined_post": ("events_baselined", masks["post"]),
+                "events_unbaselined_pre": ("events_unbaselined", masks["pre"]),
+                "events_unbaselined_post": ("events_unbaselined", masks["post"]),
+                "events_baselined_full_pre": ("events_baselined", masks["full_pre"]),
+                "dff_baselined_post": ("dff_baselined", masks["post"]),
+            }
+            features = {}
+            expected_shape = (len(trial_ids), len(cells), len(rel))
+            for name, (source_name, mask) in source_arrays.items():
+                dataset = tl[source_name]
+                if dataset.shape != expected_shape:
+                    raise ValueError(
+                        f"feature source {oeid} {source_name} shape {dataset.shape}; "
+                        f"expected {expected_shape}")
+                features[name] = np.asarray(dataset[:, :, mask].mean(axis=2),
+                                            dtype=np.float32)
+
+        session_labels = labels[labels.behavior_session_id.astype(int).eq(bsid)].copy()
+        if "trial_id" not in session_labels or session_labels.trial_id.duplicated().any():
+            raise ValueError(f"behavior labels for {bsid} lack unique trial IDs")
+        label_ids = set(session_labels.trial_id.astype(int))
+        missing_labels = sorted(set(map(int, trial_ids)) - label_ids)
+        if missing_labels:
+            raise ValueError(f"behavior labels missing trials for {oeid}: {missing_labels}")
+        aligned_labels = session_labels.set_index("trial_id").reindex(trial_ids)
+        aligned_labels.index.name = "trial_id"
+
+        q2 = pd.read_parquet(source / f"{oeid}.q2.parquet")
+        if "trial_id" not in q2 or q2.trial_id.duplicated().any():
+            raise ValueError(f"Q2 table for {oeid} lacks unique trial IDs")
+        q2_ids = set(q2.trial_id.astype(int))
+        missing_q2 = sorted(set(map(int, trial_ids)) - q2_ids)
+        if missing_q2:
+            raise ValueError(f"Q2 table missing trials for {oeid}: {missing_q2}")
+        aligned_q2 = q2.set_index("trial_id").reindex(trial_ids)
+        aligned_q2.index.name = "trial_id"
+
+        feature_path = staging / f"{oeid}.features.h5"
+        chunks = (min(256, len(trial_ids)), min(64, len(cells)))
+        with h5py.File(feature_path, "w") as h5:
+            h5.attrs.update({
+                "schema": FEATURE_CACHE_SCHEMA,
+                "ophys_experiment_id": oeid,
+                "behavior_session_id": bsid,
+                "neural_data_release": data_release,
+                "data_manifest_sha256": data_manifest_sha256,
+                "behavioral_release": behavioral_release,
+            })
+            h5.create_dataset("trial_id", data=trial_ids)
+            h5.create_dataset("cell_specimen_id", data=cells)
+            for name, matrix in features.items():
+                h5.create_dataset(name, data=matrix, chunks=chunks,
+                                  compression="gzip", compression_opts=4, shuffle=True)
+        aligned_labels.reset_index().to_parquet(
+            staging / f"{oeid}.labels.parquet", index=False)
+        aligned_q2.reset_index().to_parquet(
+            staging / f"{oeid}.q2.parquet", index=False)
+        identity = {column: _json_scalar(getattr(row, column))
+                    for column in row._fields}
+        metadata = {
+            "schema": FEATURE_CACHE_SCHEMA,
+            "identity": identity,
+            "neural_data_release": data_release,
+            "data_manifest_sha256": data_manifest_sha256,
+            "behavioral_release": behavioral_release,
+            "n_trials": int(len(trial_ids)),
+            "n_cells": int(len(cells)),
+            "dtype": "float32",
+            "features": list(FEATURE_DATASETS),
+            "windows_seconds": {
+                "post": [FIT_START, FIT_END],
+                "unbaselined_pre": [PUPIL_START, PUPIL_END],
+                "baselined_full_pre": [WINDOW_START, 0.0],
+            },
+            "fold_independent": True,
+            "contains_oof_predictions": False,
+            "allen_nwb_download": False,
+        }
+        (staging / f"{oeid}.feature-meta.json").write_text(
+            json.dumps(metadata, indent=2) + "\n")
+        if not feature_cache_complete(staging, oeid):
+            raise RuntimeError(f"staged feature cache incomplete for {oeid}")
+        out.mkdir(parents=True, exist_ok=True)
+        for staged, final in zip(feature_cache_paths(staging, oeid),
+                                 feature_cache_paths(out, oeid)):
+            staged.replace(final)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def feature_cache_failures(root: Path, manifest: pd.DataFrame) -> list[dict]:
+    """Validate the exact active feature package without touching neural NWBs."""
+    import h5py
+    active = manifest[manifest.role.eq("active")].copy()
+    expected_files = {path.name for oeid in active.ophys_experiment_id.astype(int)
+                      for path in feature_cache_paths(root, oeid)}
+    actual_files = {path.name for path in root.iterdir()
+                    if path.is_file() and path.name[:1].isdigit()}
+    failures = []
+    if actual_files != expected_files:
+        failures.append({
+            "scope": "package",
+            "problems": [
+                f"missing:{sorted(expected_files-actual_files)}",
+                f"extra:{sorted(actual_files-expected_files)}",
+            ],
+        })
+    for row in active.itertuples(index=False):
+        oeid, bsid, problems = (int(row.ophys_experiment_id),
+                                int(row.behavior_session_id), [])
+        if not feature_cache_complete(root, oeid):
+            failures.append({"ophys_experiment_id": oeid,
+                             "problems": ["incomplete_feature_files"]})
+            continue
+        try:
+            labels = pd.read_parquet(root / f"{oeid}.labels.parquet")
+            q2 = pd.read_parquet(root / f"{oeid}.q2.parquet")
+            metadata = json.loads((root / f"{oeid}.feature-meta.json").read_text())
+            if metadata.get("schema") != FEATURE_CACHE_SCHEMA:
+                problems.append("metadata_schema")
+            if int(metadata.get("identity", {}).get("ophys_experiment_id", -1)) != oeid:
+                problems.append("metadata_experiment_id")
+            with h5py.File(root / f"{oeid}.features.h5", "r") as h5:
+                if h5.attrs.get("schema") != FEATURE_CACHE_SCHEMA:
+                    problems.append("h5_schema")
+                if int(h5.attrs.get("behavior_session_id", -1)) != bsid:
+                    problems.append("h5_behavior_session_id")
+                required = {"trial_id", "cell_specimen_id", *FEATURE_DATASETS}
+                problems.extend(f"missing_h5:{name}"
+                                for name in sorted(required-set(h5.keys())))
+                if required.issubset(h5.keys()):
+                    trial_ids = np.asarray(h5["trial_id"][:], dtype=np.int64)
+                    cells = np.asarray(h5["cell_specimen_id"][:], dtype=np.int64)
+                    shape = (len(trial_ids), len(cells))
+                    if not len(trial_ids) or len(np.unique(trial_ids)) != len(trial_ids):
+                        problems.append("trial_ids")
+                    if not len(cells) or len(np.unique(cells)) != len(cells):
+                        problems.append("cell_ids")
+                    for name in FEATURE_DATASETS:
+                        if h5[name].shape != shape:
+                            problems.append(f"shape:{name}")
+                    baseline = np.asarray(h5["events_baselined_full_pre"][:], float)
+                    if not np.isfinite(baseline).all() or np.max(np.abs(baseline)) > 1e-5:
+                        problems.append("baseline_integrity")
+                    if (labels.trial_id.astype(int).tolist() != trial_ids.tolist() or
+                            q2.trial_id.astype(int).tolist() != trial_ids.tolist()):
+                        problems.append("trial_alignment")
+        except Exception as exc:
+            problems.append(f"validation_error:{type(exc).__name__}:{exc}")
+        if problems:
+            failures.append({"ophys_experiment_id": oeid, "problems": problems})
+    return failures
+
+
+def materialize_feature_cache(source: Path, manifest_path: Path,
+                              behavior_dir: Path, out: Path, container: int,
+                              *, data_release: str,
+                              data_manifest_sha256: str,
+                              behavioral_release: str) -> int:
+    manifest = pd.read_csv(manifest_path)
+    if (len(manifest) != 70 or manifest.ophys_experiment_id.astype(int).nunique() != 70 or
+            manifest.ophys_container_id.astype(int).nunique() != 10 or
+            int(manifest.role.eq("active").sum()) != 50 or
+            int(manifest.role.eq("passive").sum()) != 20):
+        raise ValueError("feature cache requires exact 50 active + 20 passive DEV manifest")
+    selected = manifest[manifest.ophys_container_id.astype(int).eq(int(container))].copy()
+    if selected.empty:
+        raise ValueError(f"container {container} is absent from DEV manifest")
+    validate_bundles(source, selected)
+    appendix_failures = appendix_a_failures(source, selected)
+    if appendix_failures:
+        raise ValueError(f"Appendix-A validation failed: {appendix_failures}")
+    labels = pd.read_parquet(behavior_dir / "_trial_labels.parquet")
+    active = selected[selected.role.eq("active")]
+    expected_sessions = set(active.behavior_session_id.astype(int))
+    observed_sessions = set(labels.behavior_session_id.astype(int))
+    missing_sessions = sorted(expected_sessions-observed_sessions)
+    if missing_sessions:
+        raise ValueError(f"behavior labels missing active sessions {missing_sessions}")
+    out.mkdir(parents=True, exist_ok=True)
+    materialized, skipped = [], []
+    for row in active.itertuples(index=False):
+        oeid = int(row.ophys_experiment_id)
+        if feature_cache_complete(out, oeid):
+            skipped.append(oeid)
+            continue
+        for path in feature_cache_paths(out, oeid):
+            path.unlink(missing_ok=True)
+        _write_feature_cache_experiment(
+            source, out, row, labels, data_release=data_release,
+            data_manifest_sha256=data_manifest_sha256,
+            behavioral_release=behavioral_release)
+        materialized.append(oeid)
+    failures = feature_cache_failures(out, selected)
+    report = {
+        "schema": FEATURE_CACHE_SCHEMA,
+        "container_id": int(container),
+        "active_experiments": sorted(active.ophys_experiment_id.astype(int).tolist()),
+        "materialized": materialized,
+        "skipped": skipped,
+        "failures": failures,
+        "neural_data_release": data_release,
+        "data_manifest_sha256": data_manifest_sha256,
+        "behavioral_release": behavioral_release,
+        "allen_nwb_download": False,
+    }
+    (out / f"_features-container-{int(container)}.json").write_text(
+        json.dumps(report, indent=2) + "\n")
+    shutil.rmtree(out / ".staging", ignore_errors=True)
+    if failures:
+        raise ValueError(f"feature cache validation failed: {failures}")
+    return 0
+
+
+def verify_feature_cache(root: Path, manifest_path: Path, report_path: Path | None) -> int:
+    manifest = pd.read_csv(manifest_path)
+    active = manifest[manifest.role.eq("active")]
+    manifest_problems = []
+    if len(manifest) != 70: manifest_problems.append(f"experiments:{len(manifest)}")
+    if len(active) != 50: manifest_problems.append(f"active:{len(active)}")
+    if int(manifest.role.eq("passive").sum()) != 20: manifest_problems.append("passive")
+    if manifest.ophys_container_id.astype(int).nunique() != 10:
+        manifest_problems.append("containers")
+    failures = ([{"scope": "manifest", "problems": manifest_problems}]
+                if manifest_problems else [])
+    failures.extend(feature_cache_failures(root, manifest))
+    report = {"schema": FEATURE_CACHE_SCHEMA, "n_experiments": int(len(active)),
+              "n_containers": int(manifest.ophys_container_id.nunique()),
+              "complete": not failures, "failures": failures,
+              "allen_nwb_download": False}
+    if report_path:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, indent=2))
+    return 1 if failures else 0
 
 
 def _folds(raw_index: np.ndarray, n_blocks=N_BLOCKS, gap=GAP_RAW_TRIALS):
@@ -1220,12 +1519,33 @@ def main() -> int:
     s.add_argument("--out", type=Path, required=True)
     s.add_argument("--data-release")
     s.add_argument("--data-manifest-sha256")
+    f = sub.add_parser("features")
+    f.add_argument("--manifest", type=Path, required=True)
+    f.add_argument("--neural", type=Path, required=True)
+    f.add_argument("--behavior", type=Path, required=True)
+    f.add_argument("--out", type=Path, required=True)
+    f.add_argument("--container", type=int, required=True)
+    f.add_argument("--data-release", required=True)
+    f.add_argument("--data-manifest-sha256", required=True)
+    f.add_argument("--behavioral-release", required=True)
+    vf = sub.add_parser("feature-verify")
+    vf.add_argument("--manifest", type=Path, required=True)
+    vf.add_argument("--features", type=Path, required=True)
+    vf.add_argument("--report", type=Path)
     args = ap.parse_args()
     if args.cmd == "manifest": return make_manifest(args.ids_from, args.out, args.cache)
     if args.cmd == "scan":
         return scan(args.neural, args.manifest, args.behavior, args.out,
                     data_release=args.data_release,
                     data_manifest_sha256=args.data_manifest_sha256)
+    if args.cmd == "features":
+        return materialize_feature_cache(
+            args.neural, args.manifest, args.behavior, args.out, args.container,
+            data_release=args.data_release,
+            data_manifest_sha256=args.data_manifest_sha256,
+            behavioral_release=args.behavioral_release)
+    if args.cmd == "feature-verify":
+        return verify_feature_cache(args.features, args.manifest, args.report)
     manifest = pd.read_csv(args.manifest)
     k, n = parse_shard(args.shard)
     containers = sorted(manifest.ophys_container_id.astype(int).unique())

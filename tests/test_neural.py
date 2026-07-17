@@ -110,6 +110,52 @@ class NeuralTests(unittest.TestCase):
                 self.assertIn("pupil", h5["trial_locked"])
                 self.assertIn("running", h5["trial_locked"])
 
+    def test_feature_cache_materializes_registered_windows_and_exact_alignment(self):
+        timestamps = np.arange(0, 10, .1)
+        cells = pd.DataFrame({"cell_roi_id": [11, 12], "valid_roi": [True, True]},
+                             index=pd.Index([101, 102], name="cell_specimen_id"))
+        traces = [np.sin(timestamps), np.cos(timestamps)]
+        exp = SimpleNamespace(
+            ophys_timestamps=timestamps,
+            cell_specimen_table=cells,
+            dff_traces=pd.DataFrame({"dff": traces}, index=cells.index),
+            events=pd.DataFrame({"events": traces}, index=cells.index))
+        trials = pd.DataFrame({"trials_id": [1, 2], "change_time": [2.0, 5.0]})
+        trace = pd.DataFrame({"timestamps": timestamps, "speed": 1.0})
+        eye = trace.rename(columns={"speed": "pupil_area"})
+        manifest = pd.DataFrame([{
+            "ophys_experiment_id": 123, "behavior_session_id": 456,
+            "ophys_container_id": 789, "mouse_id": 10,
+            "project_code": "A", "session_type": "OPHYS_1_images_A",
+            "role": "active",
+        }])
+        labels = pd.DataFrame({"trial_id": [1, 2], "behavior_session_id": [456, 456],
+                               "trial_index": [10, 20], "engaged_B": [True, False]})
+        with tempfile.TemporaryDirectory() as tmp:
+            root, out = Path(tmp) / "source", Path(tmp) / "features"
+            root.mkdir(); out.mkdir()
+            neural._write_h5(root / "123.neural.h5", exp, "active", trials, eye, trace)
+            pd.DataFrame({"trial_id": [1, 2], "change_time": [2.0, 5.0],
+                          "q2_covariates_complete": [True, True]}).to_parquet(
+                              root / "123.q2.parquet", index=False)
+            row = next(manifest.itertuples(index=False))
+            neural._write_feature_cache_experiment(
+                root, out, row, labels, data_release="neural-dev-data-1",
+                data_manifest_sha256="a" * 64,
+                behavioral_release="behavioral-v3.1-1")
+            import h5py
+            with h5py.File(out / "123.features.h5", "r") as h5:
+                self.assertEqual(h5.attrs["schema"], neural.FEATURE_CACHE_SCHEMA)
+                self.assertEqual(h5["events_baselined_post"].shape, (2, 2))
+                self.assertEqual(h5["events_unbaselined_pre"].shape, (2, 2))
+                self.assertLess(float(np.max(np.abs(
+                    h5["events_baselined_full_pre"][:]))), 1e-5)
+            self.assertEqual(pd.read_parquet(out / "123.labels.parquet").trial_id.tolist(),
+                             [1, 2])
+            self.assertEqual(neural.feature_cache_failures(out, manifest), [])
+            (out / "999.extra").write_text("unexpected")
+            self.assertTrue(neural.feature_cache_failures(out, manifest))
+
     def test_v32_freezes_only_k50_and_c50(self):
         self.assertEqual(neural.PRIMARY_K, 50)
         self.assertEqual(neural.FROZEN_C50, 1e-4)
@@ -210,6 +256,25 @@ class NeuralTests(unittest.TestCase):
         self.assertNotIn("neural.py manifest", workflow)
         self.assertNotIn("allen-neural", workflow)
 
+    def test_feature_cache_workflow_streams_once_and_publishes_resumable_cache(self):
+        workflow = (ROOT / ".github/workflows/neural-feature-cache.yml").read_text()
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("neural_data_release:", workflow)
+        self.assertIn("behavioral_release:", workflow)
+        self.assertIn('gh release download "$DATA_TAG"', workflow)
+        self.assertIn("neural-dev-features-v1-", workflow)
+        self.assertIn("reuse verified draft assets", workflow)
+        self.assertIn("neural.py features", workflow)
+        self.assertIn("neural.py feature-verify", workflow)
+        self.assertIn("n_active_experiments", workflow)
+        self.assertIn("contains_oof_predictions", workflow)
+        self.assertIn("allen_nwb_download=false", workflow)
+        self.assertIn("--prerelease --draft", workflow)
+        self.assertIn("--draft=false", workflow)
+        self.assertNotIn("neural.py pull", workflow)
+        self.assertNotIn("neural.py manifest", workflow)
+        self.assertNotIn("allen-neural", workflow)
+
     def test_neural_data_backfill_streams_existing_artifacts_to_draft_release(self):
         workflow = (ROOT / ".github/workflows/neural-data-backfill.yml").read_text()
         self.assertIn("source_run_id:", workflow)
@@ -236,6 +301,18 @@ class NeuralTests(unittest.TestCase):
         self.assertIn("unbaselined events mean in `[-1,0)`", text)
         self.assertIn("K=50 remains the only authoritative", text)
         self.assertIn("Q2 precision requires", text)
+
+    def test_v33_prereg_freezes_conditional_anchor_cache_and_nested_q2(self):
+        text = (ROOT / "prereg_v3.3.md").read_text()
+        self.assertIn("neural-dev-features-v1-*", text)
+        self.assertIn("fold-independent", text)
+        self.assertIn("AUC_cond", text)
+        self.assertIn("at least three of five", text)
+        self.assertIn("10**{-4,-3,-2,-1,0,1,2}", text)
+        self.assertIn("sigmoid", text)
+        self.assertIn("calibrator", text)
+        self.assertIn("usable_positive", text)
+        self.assertIn("no CONFIRM workflow", text)
 
 
 if __name__ == "__main__":
