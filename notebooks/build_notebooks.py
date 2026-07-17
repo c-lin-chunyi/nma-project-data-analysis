@@ -109,7 +109,7 @@ NEURAL_DEPENDENCY_SETUP = DEPENDENCY_SETUP.replace(
     '    ("plotly", "plotly", "plotly"),\n',
     '    ("matplotlib", "matplotlib", "matplotlib"),\n'
     '    ("seaborn", "seaborn", "seaborn"),\n',
-)
+).replace('    ("ipywidgets", "ipywidgets", "ipywidgets"),\n', "")
 
 
 BEHAVIOR_LOAD = r"""
@@ -420,23 +420,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-import ipywidgets as widgets
 from IPython.display import HTML, display
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_curve
 from sklearn.preprocessing import StandardScaler
 
-try:
-    from google.colab import output as colab_output
-    colab_output.enable_custom_widget_manager()
-except ImportError:
-    pass
-
 sns.set_theme(style="whitegrid", context="notebook")
 
 
 def display_matplotlib_figure(figure):
-    # Emit a native PNG payload that is reliable inside Colab Output widgets.
+    # Emit a native PNG payload that is reliable in Colab.
     try:
         figure.tight_layout()
     except Exception:
@@ -570,7 +563,7 @@ display_matplotlib_figure(figure)
 """
 
 
-NEURAL_WIDGETS = r"""
+NEURAL_STATIC_ANALYSIS = r"""
 FEATURE_LABELS = {
     "events_baselined_post": "Events · baseline-subtracted · [0, 0.30)s",
     "events_unbaselined_pre": "Events · unbaselined · [-1, 0)s",
@@ -579,73 +572,25 @@ FEATURE_LABELS = {
     "dff_baselined_post": "dF/F · baseline-subtracted · [0, 0.30)s",
 }
 
-mouse_dd = widgets.Dropdown(
-    options=sorted(index.mouse_id.astype(int).unique()),
-    description="Mouse:", style={"description_width": "initial"},
-)
-container_dd = widgets.Dropdown(
-    description="Container:", style={"description_width": "initial"}
-)
-experiment_dd = widgets.Dropdown(
-    description="Experiment:", style={"description_width": "initial"}
-)
-feature_dd = widgets.Dropdown(
-    options=[(label, name) for name, label in FEATURE_LABELS.items()],
-    value="events_baselined_post",
-    description="Representation:", style={"description_width": "initial"},
-    layout={"width": "430px"},
-)
-scale_dd = widgets.ToggleButtons(
-    options=[("Cell z-score", "z"), ("Raw", "raw")],
-    value="z", description="Heatmap:",
-)
-cell_sort_dd = widgets.Dropdown(
-    options=[("Late-hit effect", "effect"), ("Variance", "variance")],
-    value="effect", description="Cell order:", style={"description_width": "initial"},
-)
-matrix_out = widgets.Output()
-geometry_out = widgets.Output()
-decoder_out = widgets.Output()
+# Edit this compact configuration block, then rerun the cell.
+SELECTED_EXPERIMENT_ID = int(index.iloc[0].ophys_experiment_id)
+REPRESENTATION = "events_baselined_post"
+HEATMAP_SCALE = "z"  # "z" or "raw"
+CELL_ORDER = "effect"  # "effect" or "variance"
+PCA_COLOR = "outcome"  # "outcome", "engaged_B", or "session_position"
 
+DECODER_REPRESENTATION = "events_baselined_post"
+DECODER_K = 50
+DECODER_C = 1e-4
+DECODER_SEEDS = 10
+DECODER_CV = "blocked"  # "blocked" registered; "random" exploratory
 
-def visible_widget_errors(output, function):
-    # Keep callback failures visible instead of leaving a blank Colab panel.
-    def wrapped(change=None):
-        try:
-            return function(change)
-        except Exception as exc:
-            output.outputs = ()
-            with output:
-                display(HTML(
-                    "<b>Rendering failed.</b> The exception below is shown so "
-                    "the notebook does not fail silently."
-                ))
-                print(f"{type(exc).__name__}: {exc}")
-    return wrapped
-
-
-def sync_containers(*_):
-    rows = index[index.mouse_id.astype(int).eq(int(mouse_dd.value))]
-    options = [int(value) for value in sorted(rows.ophys_container_id.astype(int).unique())]
-    previous = container_dd.value
-    container_dd.options = options
-    container_dd.value = previous if previous in options else (options[0] if options else None)
-
-
-def sync_experiments(*_):
-    if container_dd.value is None:
-        experiment_dd.options = []
-        return
-    rows = index[index.ophys_container_id.astype(int).eq(int(container_dd.value))]
-    options = [
-        (f"{int(row.ophys_experiment_id)} · {row.session_type}", int(row.ophys_experiment_id))
-        for row in rows.sort_values("ophys_experiment_id").itertuples()
-    ]
-    previous = experiment_dd.value
-    experiment_dd.options = options
-    values = [value for _, value in options]
-    experiment_dd.value = previous if previous in values else (values[0] if values else None)
-    update_k_options()
+if SELECTED_EXPERIMENT_ID not in set(index.ophys_experiment_id.astype(int)):
+    raise ValueError(
+        f"SELECTED_EXPERIMENT_ID={SELECTED_EXPERIMENT_ID} is not in the DEV cache."
+    )
+if REPRESENTATION not in FEATURE_LABELS:
+    raise ValueError(f"Unknown REPRESENTATION: {REPRESENTATION}")
 
 
 def selected_effect(values, labels):
@@ -686,33 +631,29 @@ def bootstrap_population(frame, groups, n_boot=500):
     return pd.DataFrame(rows)
 
 
-def render_matrix(*_, direct=False):
-    if experiment_dd.value is None:
-        return
-    oeid = int(experiment_dd.value)
-    matrix, labels, _ = experiment_data(oeid, feature_dd.value)
+def render_matrix():
+    oeid = SELECTED_EXPERIMENT_ID
+    matrix, labels, _ = experiment_data(oeid, REPRESENTATION)
     values = matrix.values.astype(float)
     effect = selected_effect(values, labels)
     order = (
         np.argsort(np.abs(effect))[::-1]
-        if cell_sort_dd.value == "effect"
+        if CELL_ORDER == "effect"
         else np.argsort(np.nanvar(values, axis=0))[::-1]
     )
     order = order[: min(200, len(order))]
     trial_outcome = outcome_labels(labels)
     trial_order = np.lexsort((labels.trial_index.to_numpy(), trial_outcome))
     shown = values[trial_order][:, order]
-    if scale_dd.value == "z":
+    if HEATMAP_SCALE == "z":
         mean = np.nanmean(shown, axis=0)
         sd = np.nanstd(shown, axis=0)
         shown = np.divide(shown - mean, sd, out=np.zeros_like(shown), where=sd > 0)
     population = np.nanmean(values, axis=1)
     summary = bootstrap_population(population, trial_outcome)
-    if not direct:
-        matrix_out.outputs = ()
-    with (nullcontext() if direct else matrix_out):
+    with nullcontext():
         display(HTML(
-            f"<h3>Experiment {oeid}</h3><p>{FEATURE_LABELS[feature_dd.value]} · "
+            f"<h3>Experiment {oeid}</h3><p>{FEATURE_LABELS[REPRESENTATION]} · "
             f"{len(values):,} trials × {values.shape[1]:,} cells. "
             f"Heatmap shows the top {len(order)} cells.</p>"
         ))
@@ -729,7 +670,7 @@ def render_matrix(*_, direct=False):
             xticklabels=max(1, len(order) // 20),
             yticklabels=max(1, len(heat_frame) // 25),
             cbar_kws={
-                "label": "Cell z-score" if scale_dd.value == "z" else "Response"
+                "label": "Cell z-score" if HEATMAP_SCALE == "z" else "Response"
             },
             ax=axis,
         )
@@ -831,24 +772,13 @@ def render_matrix(*_, direct=False):
         display_matplotlib_figure(figure)
 
 
-geometry_color_dd = widgets.Dropdown(
-    options=["outcome", "engaged_B", "session_position"],
-    value="outcome", description="PCA color:", style={"description_width": "initial"},
-)
-
-
-def render_geometry(*_, direct=False):
-    if experiment_dd.value is None:
-        return
-    oeid = int(experiment_dd.value)
-    matrix, labels, q2 = experiment_data(oeid, feature_dd.value)
+def render_geometry():
+    oeid = SELECTED_EXPERIMENT_ID
+    matrix, labels, q2 = experiment_data(oeid, REPRESENTATION)
     values = matrix.values.astype(float)
     finite = np.isfinite(values).all(axis=1)
     if finite.sum() < 3:
-        if not direct:
-            geometry_out.outputs = ()
-        with (nullcontext() if direct else geometry_out):
-            print("PCA nonestimable: fewer than three finite trials.")
+        print("PCA nonestimable: fewer than three finite trials.")
         return
     scaled = StandardScaler().fit_transform(values[finite])
     n_components = min(10, scaled.shape[0], scaled.shape[1])
@@ -862,11 +792,9 @@ def render_geometry(*_, direct=False):
     joint = q2.copy()
     joint["population_response"] = population
     joint["outcome"] = outcome_labels(labels)
-    if not direct:
-        geometry_out.outputs = ()
-    with (nullcontext() if direct else geometry_out):
+    with nullcontext():
         figure, axis = plt.subplots(figsize=(9, 6))
-        color_column = geometry_color_dd.value
+        color_column = PCA_COLOR
         sns.scatterplot(
             data=plot,
             x="PC1",
@@ -877,7 +805,7 @@ def render_geometry(*_, direct=False):
             alpha=0.75,
             ax=axis,
         )
-        axis.set_title(f"Trial geometry · {FEATURE_LABELS[feature_dd.value]}")
+        axis.set_title(f"Trial geometry · {FEATURE_LABELS[REPRESENTATION]}")
         axis.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
         display_matplotlib_figure(figure)
 
@@ -936,75 +864,25 @@ def render_geometry(*_, direct=False):
         display_matplotlib_figure(figure)
 
 
-decoder_feature_dd = widgets.Dropdown(
-    options=[(label, name) for name, label in FEATURE_LABELS.items()],
-    value="events_baselined_post",
-    description="Representation:", style={"description_width": "initial"},
-    layout={"width": "430px"},
-)
-k_dd = widgets.Dropdown(description="K:", style={"description_width": "initial"})
-c_dd = widgets.Dropdown(
-    options=[("1e-5", 1e-5), ("1e-4 · registered", 1e-4), ("1e-3", 1e-3),
-             ("1e-2", 1e-2), ("1e-1", 1e-1), ("1", 1.0), ("10", 10.0)],
-    value=1e-4, description="C:", style={"description_width": "initial"},
-)
-seed_dd = widgets.Dropdown(
-    options=[1, 5, 10], value=10, description="Seeds:",
-    style={"description_width": "initial"},
-)
-cv_dd = widgets.Dropdown(
-    options=[("Blocked + purge · registered", "blocked"),
-             ("Random stratified · diagnostic", "random")],
-    value="blocked", description="CV:", style={"description_width": "initial"},
-)
-run_button = widgets.Button(
-    description="Run decoder", button_style="primary", icon="play"
-)
-decoder_cache = {}
-
-
-def update_k_options(*_):
-    if experiment_dd.value is None:
-        return
-    n_cells = int(
-        index.loc[
-            index.ophys_experiment_id.astype(int).eq(int(experiment_dd.value)), "n_cells"
-        ].iloc[0]
-    )
-    options = [(str(k), k) for k in (20, 50, 100) if k <= n_cells]
-    options.append((f"All ({n_cells}) · exploratory", None))
-    k_dd.options = options
-    if 50 <= n_cells:
-        k_dd.value = 50
-
-
-def decoder_key():
-    return (
-        int(experiment_dd.value), decoder_feature_dd.value, k_dd.value,
-        float(c_dd.value), int(seed_dd.value), cv_dd.value,
-    )
-
-
-def render_decoder(_=None):
-    key = decoder_key()
-    oeid, feature, k, C, n_seeds, cv = key
+def render_decoder():
+    oeid = SELECTED_EXPERIMENT_ID
+    feature = DECODER_REPRESENTATION
+    k = DECODER_K
+    C = DECODER_C
+    n_seeds = DECODER_SEEDS
+    cv = DECODER_CV
     config = DecoderConfig(k=k, C=C, n_seeds=n_seeds, cv=cv)
-    decoder_out.outputs = ()
-    with decoder_out:
-        label = "REGISTERED DEFAULTS" if not config.exploratory else "EXPLORATORY"
-        color = "#166534" if not config.exploratory else "#b45309"
-        display(HTML(
-            f"<div style='padding:8px;border-left:4px solid {color}'><b>{label}</b> · "
-            "Single-experiment educational analysis; not an authoritative mouse-level result."
-            "</div>"
-        ))
-        print("Fitting train-only scalers and logistic models…")
-    if key not in decoder_cache:
-        matrix, labels, _ = experiment_data(oeid, feature)
-        decoder_cache[key] = run_q1_decoder(matrix, labels, config)
-    result = decoder_cache[key]
-    decoder_out.outputs = ()
-    with decoder_out:
+    label = "REGISTERED DEFAULTS" if not config.exploratory else "EXPLORATORY"
+    color = "#166534" if not config.exploratory else "#b45309"
+    display(HTML(
+        f"<div style='padding:8px;border-left:4px solid {color}'><b>{label}</b> · "
+        "Single-experiment educational analysis; not an authoritative mouse-level result."
+        "</div>"
+    ))
+    print("Fitting train-only scalers and logistic models…")
+    matrix, labels, _ = experiment_data(oeid, feature)
+    result = run_q1_decoder(matrix, labels, config)
+    with nullcontext():
         display(HTML(
             f"<div style='padding:8px;border-left:4px solid {color}'><b>{label}</b> · "
             "Single-experiment educational analysis; not an authoritative mouse-level result."
@@ -1135,55 +1013,22 @@ def render_decoder(_=None):
         display_matplotlib_figure(figure)
 
 
-# Establish a complete initial selection before registering observers. This
-# avoids a burst of overlapping renders while Colab is mounting the widget tree.
-sync_containers()
-sync_experiments()
-update_k_options()
+selected_row = index.loc[
+    index.ophys_experiment_id.astype(int).eq(SELECTED_EXPERIMENT_ID)
+].iloc[0]
+display(HTML(
+    "<h2>Static single-experiment analysis</h2>"
+    f"<p>Mouse {int(selected_row.mouse_id)} · "
+    f"container {int(selected_row.ophys_container_id)} · "
+    f"experiment {SELECTED_EXPERIMENT_ID} · "
+    f"{selected_row.session_type}</p>"
+    "<p>Edit the configuration block at the top of this cell and rerun it "
+    "to inspect a different experiment or representation.</p>"
+))
 
-matrix_controls = widgets.VBox([
-    widgets.HBox([feature_dd, scale_dd, cell_sort_dd]),
-    matrix_out,
-])
-geometry_controls = widgets.VBox([
-    geometry_color_dd,
-    geometry_out,
-])
-decoder_controls = widgets.VBox([
-    widgets.HBox([decoder_feature_dd, k_dd, c_dd]),
-    widgets.HBox([seed_dd, cv_dd, run_button]),
-    decoder_out,
-])
-tabs = widgets.Tab(children=[matrix_controls, geometry_controls, decoder_controls])
-for i, title in enumerate(["Matrix Explorer", "Trial Geometry", "Decoder Lab"]):
-    tabs.set_title(i, title)
-
-mouse_dd.observe(sync_containers, names="value")
-container_dd.observe(sync_experiments, names="value")
-experiment_dd.observe(update_k_options, names="value")
-matrix_handler = visible_widget_errors(matrix_out, render_matrix)
-geometry_handler = visible_widget_errors(geometry_out, render_geometry)
-decoder_handler = visible_widget_errors(decoder_out, render_decoder)
-feature_dd.observe(matrix_handler, names="value")
-feature_dd.observe(geometry_handler, names="value")
-scale_dd.observe(matrix_handler, names="value")
-cell_sort_dd.observe(matrix_handler, names="value")
-geometry_color_dd.observe(geometry_handler, names="value")
-experiment_dd.observe(matrix_handler, names="value")
-experiment_dd.observe(geometry_handler, names="value")
-run_button.on_click(decoder_handler)
-
-display(widgets.VBox([
-    widgets.HTML("<h2>Select an experiment</h2>"),
-    widgets.HBox([mouse_dd, container_dd, experiment_dd]),
-    tabs,
-]))
-
-# The first render is emitted directly by the cell as native image/png. This
-# avoids relying on nested widget-output capture during Colab's initial mount.
-# Later selector changes render into the Output panels above.
-render_matrix(direct=True)
-render_geometry(direct=True)
+render_matrix()
+render_geometry()
+render_decoder()
 """
 
 
@@ -1239,8 +1084,8 @@ neural_notebook = notebook([
     code(NEURAL_LOAD),
     markdown("## 4. Cohort browser"),
     code(NEURAL_COHORT),
-    markdown("## 5. Interactive feature explorer"),
-    code(NEURAL_WIDGETS),
+    markdown("## 5. Static single-experiment analysis"),
+    code(NEURAL_STATIC_ANALYSIS),
 ])
 
 

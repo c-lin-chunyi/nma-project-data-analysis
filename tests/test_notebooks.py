@@ -48,30 +48,27 @@ def test_neural_notebook_contains_visual_and_decoder_contracts():
     assert "Trial geometry" in text
     assert "Behavior–neural relationships" in text
     assert "Q2 covariate missingness" in text
-    assert "Run decoder" in text
-    assert "Blocked + purge · registered" in text
+    assert "render_decoder()" in final_cell
+    assert 'DECODER_CV = "blocked"' in final_cell
     assert "EXPLORATORY" in text
     assert "reset_index(names=" not in text
     assert '("matplotlib", "matplotlib", "matplotlib")' in setup
     assert '("seaborn", "seaborn", "seaborn")' in setup
     assert '("plotly", "plotly", "plotly")' not in setup
+    assert '("ipywidgets", "ipywidgets", "ipywidgets")' not in setup
     assert "display_matplotlib_figure" in final_cell
+    assert "widgets." not in final_cell
+    assert ".observe(" not in final_cell
     assert "px." not in final_cell
     assert "go." not in final_cell
     assert "kaleido" not in text
 
 
-def test_neural_widget_initialization_avoids_colab_output_races():
+def test_neural_static_analysis_runs_in_a_clear_order():
     document = json.loads(NOTEBOOKS[1].read_text())
     source = "".join(document["cells"][-1]["source"])
-    assert source.index("sync_containers()") < source.index(
-        'mouse_dd.observe(sync_containers, names="value")'
-    )
-    assert source.index("display(widgets.VBox") < source.rindex(
-        "render_matrix(direct=True)"
-    )
-    assert source.rindex("render_matrix(direct=True)") < source.rindex(
-        "render_geometry(direct=True)"
-    )
-    assert "matrix_out.clear_output" not in source
-    assert "geometry_out.clear_output" not in source
+    assert source.rindex("render_matrix()") < source.rindex("render_geometry()")
+    assert source.rindex("render_geometry()") < source.rindex("render_decoder()")
+    assert "SELECTED_EXPERIMENT_ID" in source
+    assert "widgets" not in source
+    assert "interactive" not in source.lower()
