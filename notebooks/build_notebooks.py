@@ -640,7 +640,7 @@ def render_matrix(*_):
     population = np.nanmean(values, axis=1)
     summary = bootstrap_population(population, trial_outcome)
     with matrix_out:
-        clear_output(wait=True)
+        matrix_out.clear_output(wait=True)
         display(HTML(
             f"<h3>Experiment {oeid}</h3><p>{FEATURE_LABELS[feature_dd.value]} · "
             f"{len(values):,} trials × {values.shape[1]:,} cells. "
@@ -661,7 +661,7 @@ def render_matrix(*_):
             template="plotly_white",
             height=620,
         )
-        heat.show()
+        display(heat)
 
         error = go.Figure()
         error.add_trace(go.Bar(
@@ -681,7 +681,7 @@ def render_matrix(*_):
             yaxis_title="Mean across cells",
             template="plotly_white",
         )
-        error.show()
+        display(error)
 
         effect_table = pd.DataFrame({
             "cell_id": matrix.cell_ids,
@@ -689,7 +689,7 @@ def render_matrix(*_):
             "variance": np.nanvar(values, axis=0),
         }).sort_values("effect")
         effect_table["rank"] = np.arange(len(effect_table))
-        px.scatter(
+        effect_figure = px.scatter(
             effect_table,
             x="rank",
             y="effect",
@@ -698,12 +698,13 @@ def render_matrix(*_):
             color_continuous_scale="Viridis",
             title="Per-cell standardized late-hit − miss effect",
             template="plotly_white",
-        ).show()
+        )
+        display(effect_figure)
         distribution = pd.DataFrame({
             "population_response": population,
             "outcome": trial_outcome,
         })
-        px.violin(
+        distribution_figure = px.violin(
             distribution,
             x="outcome",
             y="population_response",
@@ -712,7 +713,8 @@ def render_matrix(*_):
             points="outliers",
             title="Trial-level population-response distributions",
             template="plotly_white",
-        ).show()
+        )
+        display(distribution_figure)
 
         comparisons = [
             ("events_baselined_post", "dff_baselined_post"),
@@ -735,7 +737,7 @@ def render_matrix(*_):
         compare.update_layout(
             title="Representation comparisons", template="plotly_white"
         )
-        compare.show()
+        display(compare)
 
 
 geometry_color_dd = widgets.Dropdown(
@@ -753,7 +755,7 @@ def render_geometry(*_):
     finite = np.isfinite(values).all(axis=1)
     if finite.sum() < 3:
         with geometry_out:
-            clear_output()
+            geometry_out.clear_output()
             print("PCA nonestimable: fewer than three finite trials.")
         return
     scaled = StandardScaler().fit_transform(values[finite])
@@ -769,8 +771,8 @@ def render_geometry(*_):
     joint["population_response"] = population
     joint["outcome"] = outcome_labels(labels)
     with geometry_out:
-        clear_output(wait=True)
-        px.scatter(
+        geometry_out.clear_output(wait=True)
+        geometry_figure = px.scatter(
             plot,
             x="PC1",
             y="PC2",
@@ -778,14 +780,16 @@ def render_geometry(*_):
             hover_data=["outcome", "engaged_B", "session_position"],
             title=f"Trial geometry · {FEATURE_LABELS[feature_dd.value]}",
             template="plotly_white",
-        ).show()
-        px.bar(
+        )
+        display(geometry_figure)
+        scree_figure = px.bar(
             x=np.arange(1, n_components + 1),
             y=pca.explained_variance_ratio_,
             labels={"x": "Principal component", "y": "Explained variance ratio"},
             title="PCA scree plot",
             template="plotly_white",
-        ).show()
+        )
+        display(scree_figure)
         covariates = [
             ("pre_change_pupil", "Pre-change pupil"),
             ("pre_change_running", "Pre-change running"),
@@ -807,19 +811,20 @@ def render_geometry(*_):
             title="Behavior–neural relationships (no imputation)",
             template="plotly_white",
         )
-        relation.show()
+        display(relation)
         missing = (
             q2.isna().mean().sort_values(ascending=False).rename("missing_fraction")
             .reset_index(names="covariate")
         )
-        px.bar(
+        missingness_figure = px.bar(
             missing,
             x="missing_fraction",
             y="covariate",
             orientation="h",
             title="Q2 covariate missingness",
             template="plotly_white",
-        ).show()
+        )
+        display(missingness_figure)
 
 
 decoder_feature_dd = widgets.Dropdown(
@@ -876,7 +881,7 @@ def render_decoder(_=None):
     oeid, feature, k, C, n_seeds, cv = key
     config = DecoderConfig(k=k, C=C, n_seeds=n_seeds, cv=cv)
     with decoder_out:
-        clear_output(wait=True)
+        decoder_out.clear_output(wait=True)
         label = "REGISTERED DEFAULTS" if not config.exploratory else "EXPLORATORY"
         color = "#166534" if not config.exploratory else "#b45309"
         display(HTML(
@@ -890,7 +895,7 @@ def render_decoder(_=None):
         decoder_cache[key] = run_q1_decoder(matrix, labels, config)
     result = decoder_cache[key]
     with decoder_out:
-        clear_output(wait=True)
+        decoder_out.clear_output(wait=True)
         display(HTML(
             f"<div style='padding:8px;border-left:4px solid {color}'><b>{label}</b> · "
             "Single-experiment educational analysis; not an authoritative mouse-level result."
@@ -906,14 +911,16 @@ def render_decoder(_=None):
             f"<p>{len(result.oof):,} registered eligible trials · "
             f"{len(result.seed_metrics):,} deterministic seeds.</p>"
         ))
-        px.bar(
+        auc_figure = px.bar(
             result.seed_metrics,
             x="seed",
             y="auc",
             range_y=[0, 1],
             title="Seed-level OOF AUC",
             template="plotly_white",
-        ).add_hline(y=0.5, line_dash="dash").show()
+        )
+        auc_figure.add_hline(y=0.5, line_dash="dash")
+        display(auc_figure)
 
         fpr, tpr, _ = roc_curve(result.oof.y, result.oof.mean_score)
         roc = go.Figure(go.Scatter(x=fpr, y=tpr, mode="lines", name="Mean OOF score"))
@@ -927,7 +934,7 @@ def render_decoder(_=None):
             yaxis_title="True-positive rate",
             template="plotly_white",
         )
-        roc.show()
+        display(roc)
 
         fold = result.fold_metrics[result.fold_metrics.seed.eq(0)].melt(
             id_vars=["fold"],
@@ -935,13 +942,14 @@ def render_decoder(_=None):
             var_name="class",
             value_name="trials",
         )
-        px.bar(
+        fold_figure = px.bar(
             fold, x="fold", y="trials", color="class", barmode="stack",
             title="Seed 0 temporal test-fold support",
             template="plotly_white",
-        ).show()
+        )
+        display(fold_figure)
         temporal = result.oof.sort_values("trial_index")
-        px.scatter(
+        temporal_figure = px.scatter(
             temporal,
             x="trial_index",
             y="mean_score",
@@ -949,13 +957,14 @@ def render_decoder(_=None):
             labels={"color": "Outcome"},
             title="OOF decision score over raw trial order",
             template="plotly_white",
-        ).show()
+        )
+        display(temporal_figure)
         cells = result.cell_summary[
             result.cell_summary.selection_frequency.gt(0)
         ].sort_values(
             ["selection_frequency", "mean_abs_coefficient"], ascending=False
         ).head(60)
-        px.scatter(
+        cell_figure = px.scatter(
             cells,
             x="selection_frequency",
             y="median_coefficient",
@@ -966,7 +975,8 @@ def render_decoder(_=None):
             color_continuous_midpoint=0,
             title="Cell selection frequency and standardized coefficients",
             template="plotly_white",
-        ).show()
+        )
+        display(cell_figure)
 
 
 mouse_dd.observe(sync_containers, names="value")
@@ -980,12 +990,6 @@ geometry_color_dd.observe(render_geometry, names="value")
 experiment_dd.observe(render_matrix, names="value")
 experiment_dd.observe(render_geometry, names="value")
 run_button.on_click(render_decoder)
-
-sync_containers()
-sync_experiments()
-update_k_options()
-render_matrix()
-render_geometry()
 
 matrix_controls = widgets.VBox([
     widgets.HBox([feature_dd, scale_dd, cell_sort_dd]),
@@ -1009,6 +1013,14 @@ display(widgets.VBox([
     widgets.HBox([mouse_dd, container_dd, experiment_dd]),
     tabs,
 ]))
+
+# Colab only preserves rich widget output reliably after the Output widgets
+# have been attached to the displayed widget tree.
+sync_containers()
+sync_experiments()
+update_k_options()
+render_matrix()
+render_geometry()
 """
 
 
@@ -1017,7 +1029,6 @@ behavior_notebook = notebook([
         """
         # Behavioral DEV Playground
 
-        **Audience:** public teaching and research exploration.  
         **Data:** immutable DEV behavioral scan only; no CONFIRM access.
 
         [Release provenance](https://github.com/c-lin-chunyi/nma-project-data-analysis/releases/tag/behavioral-v3.1-29482141350)
@@ -1045,7 +1056,6 @@ neural_notebook = notebook([
         """
         # Neural Feature Explorer & Decoder Lab
 
-        **Audience:** public teaching and research exploration.  
         **Data:** immutable, fold-independent DEV feature cache only; no raw
         neural bundle and no CONFIRM access.
 
