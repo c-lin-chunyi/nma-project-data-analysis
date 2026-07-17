@@ -48,3 +48,15 @@ def test_neural_notebook_contains_visual_and_decoder_contracts():
     assert "Run decoder" in text
     assert "Blocked + purge · registered" in text
     assert "EXPLORATORY" in text
+    assert "reset_index(names=" not in text
+
+
+def test_neural_widget_initialization_avoids_colab_output_races():
+    document = json.loads(NOTEBOOKS[1].read_text())
+    source = "".join(document["cells"][-1]["source"])
+    assert source.index("sync_containers()") < source.index(
+        'mouse_dd.observe(sync_containers, names="value")'
+    )
+    assert source.index("display(widgets.VBox") < source.rindex("render_matrix()")
+    assert "matrix_out.clear_output" not in source
+    assert "geometry_out.clear_output" not in source

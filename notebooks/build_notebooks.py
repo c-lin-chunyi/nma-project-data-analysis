@@ -555,6 +555,22 @@ geometry_out = widgets.Output()
 decoder_out = widgets.Output()
 
 
+def visible_widget_errors(output, function):
+    # Keep callback failures visible instead of leaving a blank Colab panel.
+    def wrapped(change=None):
+        try:
+            return function(change)
+        except Exception as exc:
+            output.outputs = ()
+            with output:
+                display(HTML(
+                    "<b>Rendering failed.</b> The exception below is shown so "
+                    "the notebook does not fail silently."
+                ))
+                print(f"{type(exc).__name__}: {exc}")
+    return wrapped
+
+
 def sync_containers(*_):
     rows = index[index.mouse_id.astype(int).eq(int(mouse_dd.value))]
     options = [int(value) for value in sorted(rows.ophys_container_id.astype(int).unique())]
@@ -639,8 +655,8 @@ def render_matrix(*_):
         shown = np.divide(shown - mean, sd, out=np.zeros_like(shown), where=sd > 0)
     population = np.nanmean(values, axis=1)
     summary = bootstrap_population(population, trial_outcome)
+    matrix_out.outputs = ()
     with matrix_out:
-        matrix_out.clear_output(wait=True)
         display(HTML(
             f"<h3>Experiment {oeid}</h3><p>{FEATURE_LABELS[feature_dd.value]} · "
             f"{len(values):,} trials × {values.shape[1]:,} cells. "
@@ -754,8 +770,8 @@ def render_geometry(*_):
     values = matrix.values.astype(float)
     finite = np.isfinite(values).all(axis=1)
     if finite.sum() < 3:
+        geometry_out.outputs = ()
         with geometry_out:
-            geometry_out.clear_output()
             print("PCA nonestimable: fewer than three finite trials.")
         return
     scaled = StandardScaler().fit_transform(values[finite])
@@ -770,8 +786,8 @@ def render_geometry(*_):
     joint = q2.copy()
     joint["population_response"] = population
     joint["outcome"] = outcome_labels(labels)
+    geometry_out.outputs = ()
     with geometry_out:
-        geometry_out.clear_output(wait=True)
         geometry_figure = px.scatter(
             plot,
             x="PC1",
@@ -814,7 +830,7 @@ def render_geometry(*_):
         display(relation)
         missing = (
             q2.isna().mean().sort_values(ascending=False).rename("missing_fraction")
-            .reset_index(names="covariate")
+            .reset_index().rename(columns={"index": "covariate"})
         )
         missingness_figure = px.bar(
             missing,
@@ -880,8 +896,8 @@ def render_decoder(_=None):
     key = decoder_key()
     oeid, feature, k, C, n_seeds, cv = key
     config = DecoderConfig(k=k, C=C, n_seeds=n_seeds, cv=cv)
+    decoder_out.outputs = ()
     with decoder_out:
-        decoder_out.clear_output(wait=True)
         label = "REGISTERED DEFAULTS" if not config.exploratory else "EXPLORATORY"
         color = "#166534" if not config.exploratory else "#b45309"
         display(HTML(
@@ -894,8 +910,8 @@ def render_decoder(_=None):
         matrix, labels, _ = experiment_data(oeid, feature)
         decoder_cache[key] = run_q1_decoder(matrix, labels, config)
     result = decoder_cache[key]
+    decoder_out.outputs = ()
     with decoder_out:
-        decoder_out.clear_output(wait=True)
         display(HTML(
             f"<div style='padding:8px;border-left:4px solid {color}'><b>{label}</b> · "
             "Single-experiment educational analysis; not an authoritative mouse-level result."
@@ -979,17 +995,11 @@ def render_decoder(_=None):
         display(cell_figure)
 
 
-mouse_dd.observe(sync_containers, names="value")
-container_dd.observe(sync_experiments, names="value")
-experiment_dd.observe(update_k_options, names="value")
-feature_dd.observe(render_matrix, names="value")
-feature_dd.observe(render_geometry, names="value")
-scale_dd.observe(render_matrix, names="value")
-cell_sort_dd.observe(render_matrix, names="value")
-geometry_color_dd.observe(render_geometry, names="value")
-experiment_dd.observe(render_matrix, names="value")
-experiment_dd.observe(render_geometry, names="value")
-run_button.on_click(render_decoder)
+# Establish a complete initial selection before registering observers. This
+# avoids a burst of overlapping renders while Colab is mounting the widget tree.
+sync_containers()
+sync_experiments()
+update_k_options()
 
 matrix_controls = widgets.VBox([
     widgets.HBox([feature_dd, scale_dd, cell_sort_dd]),
@@ -1008,17 +1018,28 @@ tabs = widgets.Tab(children=[matrix_controls, geometry_controls, decoder_control
 for i, title in enumerate(["Matrix Explorer", "Trial Geometry", "Decoder Lab"]):
     tabs.set_title(i, title)
 
+mouse_dd.observe(sync_containers, names="value")
+container_dd.observe(sync_experiments, names="value")
+experiment_dd.observe(update_k_options, names="value")
+matrix_handler = visible_widget_errors(matrix_out, render_matrix)
+geometry_handler = visible_widget_errors(geometry_out, render_geometry)
+decoder_handler = visible_widget_errors(decoder_out, render_decoder)
+feature_dd.observe(matrix_handler, names="value")
+feature_dd.observe(geometry_handler, names="value")
+scale_dd.observe(matrix_handler, names="value")
+cell_sort_dd.observe(matrix_handler, names="value")
+geometry_color_dd.observe(geometry_handler, names="value")
+experiment_dd.observe(matrix_handler, names="value")
+experiment_dd.observe(geometry_handler, names="value")
+run_button.on_click(decoder_handler)
+
 display(widgets.VBox([
     widgets.HTML("<h2>Select an experiment</h2>"),
     widgets.HBox([mouse_dd, container_dd, experiment_dd]),
     tabs,
 ]))
 
-# Colab only preserves rich widget output reliably after the Output widgets
-# have been attached to the displayed widget tree.
-sync_containers()
-sync_experiments()
-update_k_options()
+# Render once, after the Output widgets are attached to Colab's widget tree.
 render_matrix()
 render_geometry()
 """
