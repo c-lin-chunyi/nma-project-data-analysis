@@ -42,3 +42,23 @@ calibration, and evaluation rather than tree-based decision logic.
 
 The editable diagram source is
 [`docs/v33-model-workflow.d2`](docs/v33-model-workflow.d2).
+
+## v4 DEV workflow
+
+v4 uses its own Python 3.11 environment (`requirements-v4.txt`) and does not
+alter the v1–v3 analysis environments. Run the Actions in this order:
+
+1. **build immutable neural DEV time-cache-v2** with one exact public
+   `neural-dev-data-*` tag. It publishes the active-only, actual-frame cache as
+   `neural-dev-time-v2-<source-run>`.
+2. **neural DEV v4 predictive-state hazard analysis** in `acceptance` mode to
+   run the registered simulations and future-information checks without making
+   an analysis Release.
+3. Run the same v4 workflow in `dev` mode with the exact public time-cache tag.
+   Ten mouse jobs are aggregated into the immutable prerelease
+   `neural-dev-v4-<cache-source>-r1`.
+
+A statistically nonestimable DEV result is still a valid v4 release. Pipeline
+or integrity failures prevent publication. Every v4 result keeps
+`numeric_sesoi=null` and `confirm_ready=false`; v4.1 is the separate freezing
+step.

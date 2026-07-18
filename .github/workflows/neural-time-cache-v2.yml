@@ -1,0 +1,289 @@
+name: build immutable neural DEV time-cache-v2
+
+run-name: time-cache-v2 · ${{ inputs.neural_data_release }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      neural_data_release:
+        description: 'Exact public neural-dev-data-* Release tag'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: neural-time-cache-v2-${{ inputs.neural_data_release }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      containers: ${{ steps.resolve.outputs.containers }}
+      cache_tag: ${{ steps.resolve.outputs.cache_tag }}
+      source_manifest_sha256: ${{ steps.resolve.outputs.source_manifest_sha256 }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-v4.txt
+      - name: Install isolated v4 dependencies
+        run: |
+          python -m pip install -r requirements-v4.txt
+          python -m pip check
+      - name: Validate source and reserve draft cache Release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.neural_data_release }}
+        run: |
+          set -euo pipefail
+          case "$SOURCE_TAG" in
+            neural-dev-data-*) ;;
+            *) echo "::error::exact neural-dev-data-* tag required"; exit 1 ;;
+          esac
+          test "$(gh release view "$SOURCE_TAG" --json isDraft --jq .isDraft)" = false
+          mkdir -p run/input
+          gh release download "$SOURCE_TAG" \
+            -p SHA256SUMS -p data-package-manifest.json \
+            -p dev_experiments.csv -p bundle-files.sha256 \
+            -p neural-data-provenance.json -D run/input
+          (cd run/input && \
+            grep -E '  (data-package-manifest.json|dev_experiments.csv|bundle-files.sha256|neural-data-provenance.json)$' SHA256SUMS | \
+            sha256sum --check -)
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          package=json.loads(Path('run/input/data-package-manifest.json').read_text())
+          table=pd.read_csv('run/input/dev_experiments.csv')
+          assert package['schema']=='neural-dev-data-v1'
+          assert package['n_experiments']==70 and package['n_containers']==10
+          assert len(table)==70 and table.ophys_experiment_id.nunique()==70
+          assert table.ophys_container_id.nunique()==10
+          assert int(table.role.eq('active').sum())==50
+          assert int(table.role.eq('passive').sum())==20
+          assert {part['container_id'] for part in package['parts']} == \
+                 set(table.ophys_container_id.astype(int))
+          PY
+          source_run="${SOURCE_TAG#neural-dev-data-}"
+          case "$source_run" in *[!0-9]*|'') exit 1;; esac
+          cache_tag="neural-dev-time-v2-${source_run}"
+          containers=$(python -c 'import json,pandas as pd; print(json.dumps(sorted(pd.read_csv("run/input/dev_experiments.csv").ophys_container_id.astype(int).unique().tolist())))')
+          source_manifest_sha256=$(sha256sum run/input/data-package-manifest.json | cut -d' ' -f1)
+          if gh release view "$cache_tag" >/dev/null 2>&1; then
+            test "$(gh release view "$cache_tag" --json isDraft --jq .isDraft)" = true || {
+              echo "::error::$cache_tag is already public and immutable"; exit 1;
+            }
+            test "$(gh release view "$cache_tag" --json targetCommitish --jq .targetCommitish)" = "$GITHUB_SHA"
+          else
+            gh release create "$cache_tag" --target "$GITHUB_SHA" \
+              --title "$cache_tag: immutable actual-frame DEV cache" \
+              --notes "Source: $SOURCE_TAG; code: $GITHUB_SHA" \
+              --latest=false --prerelease --draft
+          fi
+          printf 'containers=%s\ncache_tag=%s\nsource_manifest_sha256=%s\n' \
+            "$containers" "$cache_tag" "$source_manifest_sha256" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: time-cache-v2-input
+          path: run/input/
+          retention-days: 14
+          if-no-files-found: error
+
+  materialize:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        container: ${{ fromJSON(needs.prepare.outputs.containers) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-v4.txt
+      - run: python -m pip install -r requirements-v4.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: time-cache-v2-input
+          path: run/input
+      - name: Download and verify one existing neural container
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.neural_data_release }}
+          CONTAINER: ${{ matrix.container }}
+        run: |
+          set -euo pipefail
+          mkdir -p run/download run/source run/cache
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          package=json.loads(Path('run/input/data-package-manifest.json').read_text())
+          parts=sorted(
+              part for part in package['parts']
+              if int(part['container_id'])==int(os.environ['CONTAINER']))
+          assert parts
+          Path('run/parts.txt').write_text('\n'.join(p['name'] for p in parts)+'\n')
+          Path('run/parts.sha256').write_text(
+              ''.join(f"{p['sha256']}  {p['name']}\n" for p in parts))
+          PY
+          while IFS= read -r part; do
+            gh release download "$SOURCE_TAG" -p "$part" -D run/download
+          done < run/parts.txt
+          (cd run/download && sha256sum --check ../parts.sha256)
+          while IFS= read -r part; do cat "run/download/$part"; done < run/parts.txt |
+            tar -xf - -C run/source
+          ids=$(python -c 'import os,pandas as pd; t=pd.read_csv("run/input/dev_experiments.csv"); print("|".join(map(str,t.loc[t.ophys_container_id.astype(int).eq(int(os.environ["CONTAINER"])),"ophys_experiment_id"].astype(int))))')
+          grep -E "  (${ids})[.]" run/input/bundle-files.sha256 > run/container-files.sha256
+          (cd run/source && sha256sum --check ../container-files.sha256)
+      - name: Materialize actual-frame active-only cache shard
+        env:
+          SOURCE_TAG: ${{ inputs.neural_data_release }}
+          SOURCE_MANIFEST_SHA: ${{ needs.prepare.outputs.source_manifest_sha256 }}
+        run: |
+          python -m pipeline.v4 cache-materialize \
+            --source run/source \
+            --manifest run/input/dev_experiments.csv \
+            --out run/cache \
+            --container '${{ matrix.container }}' \
+            --neural-release "$SOURCE_TAG" \
+            --data-manifest-sha256 "$SOURCE_MANIFEST_SHA"
+          python - <<'PY'
+          from pathlib import Path
+          from pipeline.v4.cache import write_file_checksums
+          root=Path('run/cache')
+          paths=[path for path in root.iterdir()
+                 if path.is_file() and path.name[:1].isdigit()]
+          write_file_checksums(
+              root, paths,
+              root / '_cache-files-${{ matrix.container }}.sha256')
+          PY
+          tar -czf "time-cache-container-${{ matrix.container }}.tar.gz" -C run/cache .
+          sha256sum "time-cache-container-${{ matrix.container }}.tar.gz" \
+            > "time-cache-container-${{ matrix.container }}.tar.gz.sha256"
+      - name: Upload immutable shard to draft Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_TAG: ${{ needs.prepare.outputs.cache_tag }}
+        run: |
+          gh release upload "$CACHE_TAG" \
+            "time-cache-container-${{ matrix.container }}.tar.gz" \
+            "time-cache-container-${{ matrix.container }}.tar.gz.sha256" --clobber
+
+  finalize:
+    needs: [prepare, materialize]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-v4.txt
+      - run: |
+          python -m pip install -r requirements-v4.txt
+          python -m pip check
+      - uses: actions/download-artifact@v8
+        with:
+          name: time-cache-v2-input
+          path: run/input
+      - name: Rehydrate all shards and perform exact-50 validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_TAG: ${{ needs.prepare.outputs.cache_tag }}
+          SOURCE_TAG: ${{ inputs.neural_data_release }}
+        run: |
+          set -euo pipefail
+          mkdir -p run/download run/cache assets
+          containers='${{ needs.prepare.outputs.containers }}'
+          python -c 'import json,sys; print("\\n".join(map(str,json.loads(sys.argv[1]))))' "$containers" > run/containers.txt
+          while IFS= read -r container; do
+            archive="time-cache-container-${container}.tar.gz"
+            gh release download "$CACHE_TAG" -p "$archive" -p "${archive}.sha256" -D run/download
+            (cd run/download && sha256sum --check "${archive}.sha256")
+            tar -xzf "run/download/$archive" -C run/cache
+          done < run/containers.txt
+          python -m pipeline.v4 cache-verify \
+            --cache run/cache --manifest run/input/dev_experiments.csv \
+            --report assets/time-cache-validation.json
+          for checksum in run/cache/_cache-files-*.sha256; do
+            (cd run/cache && sha256sum --check "$(basename "$checksum")")
+          done
+          python -m pip freeze > assets/time-cache-v2-environment.txt
+          cp run/input/data-package-manifest.json assets/source-data-package-manifest.json
+          cp run/input/dev_experiments.csv run/input/neural-data-provenance.json assets/
+          cp requirements-v4.txt assets/
+          python - <<'PY'
+          import datetime, hashlib, json, os, platform
+          from pathlib import Path
+          import jax
+          jax.config.update('jax_enable_x64', True)
+          parts=[]
+          for path in sorted(Path('run/download').glob('*.tar.gz')):
+              digest=hashlib.sha256(path.read_bytes()).hexdigest()
+              container=int(path.name.split('-')[3].split('.')[0])
+              parts.append({'container_id':container,'name':path.name,
+                            'sha256':digest,'size':path.stat().st_size})
+          source=json.loads(Path('assets/source-data-package-manifest.json').read_text())
+          manifest={
+              'schema':'neural-dev-time-cache-v2',
+              'source_release':os.environ['SOURCE_TAG'],
+              'source_run':int(os.environ['SOURCE_TAG'].removeprefix('neural-dev-data-')),
+              'source_data_manifest_sha256':hashlib.sha256(
+                  Path('assets/source-data-package-manifest.json').read_bytes()).hexdigest(),
+              'n_source_experiments':70,'n_active_experiments':50,
+              'n_passive_experiments':20,'n_containers':10,
+              'active_only':True,'actual_timestamps':True,'resampled':False,
+              'contains_fitted_values':False,'allen_nwb_download':False,
+              'python':platform.python_version(),
+              'requirements_v4_sha256':hashlib.sha256(
+                  Path('assets/requirements-v4.txt').read_bytes()).hexdigest(),
+              'environment_freeze_sha256':hashlib.sha256(
+                  Path('assets/time-cache-v2-environment.txt').read_bytes()).hexdigest(),
+              'jax_version':jax.__version__,
+              'jax_x64':jax.config.read('jax_enable_x64'),
+              'jax_devices':[str(device) for device in jax.devices()],
+              'cache_file_checksum_manifests':sorted(
+                  path.name for path in Path('run/cache').glob('_cache-files-*.sha256')),
+              'parts':parts,
+          }
+          Path('assets/time-cache-manifest.json').write_text(
+              json.dumps(manifest,indent=2)+'\n')
+          provenance={
+              'schema':'neural-dev-time-cache-v2-provenance',
+              'created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'code_commit':os.environ['GITHUB_SHA'],
+              'source_release':os.environ['SOURCE_TAG'],
+              'workflow_run':f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'allen_nwb_download':False,
+          }
+          Path('assets/time-cache-provenance.json').write_text(
+              json.dumps(provenance,indent=2)+'\n')
+          PY
+          sha256sum requirements-v4.txt > assets/environment-input.sha256
+          (cd assets && sha256sum * > SHA256SUMS)
+      - name: Publish immutable cache prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_TAG: ${{ needs.prepare.outputs.cache_tag }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$CACHE_TAG" --json isDraft --jq .isDraft)" = true
+          gh release upload "$CACHE_TAG" assets/* --clobber
+          gh release edit "$CACHE_TAG" --draft=false --prerelease --latest=false

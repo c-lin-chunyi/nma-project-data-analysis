@@ -1,0 +1,326 @@
+name: neural DEV v4 predictive-state hazard analysis
+
+run-name: neural DEV v4 · ${{ inputs.mode }} · ${{ inputs.time_cache_release }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run registered acceptance only, or acceptance followed by DEV'
+        required: true
+        default: acceptance
+        type: choice
+        options:
+          - acceptance
+          - dev
+      time_cache_release:
+        description: 'Exact public neural-dev-time-v2-* tag (required only for dev)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: neural-dev-v4-${{ inputs.mode }}-${{ inputs.time_cache_release }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  JAX_ENABLE_X64: 'true'
+  XLA_FLAGS: '--xla_force_host_platform_device_count=1'
+  OMP_NUM_THREADS: '1'
+  OPENBLAS_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  NUMEXPR_NUM_THREADS: '1'
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-v4.txt
+      - name: Clean-install and inspect locked v4 runtime
+        run: |
+          python -m pip install -r requirements-v4.txt
+          python -m pip check
+          python - <<'PY'
+          import jax
+          jax.config.update('jax_enable_x64', True)
+          from glmhmmt import SoftmaxGLMHMM
+          assert hasattr(SoftmaxGLMHMM, 'predict_state_probs')
+          assert jax.config.read('jax_enable_x64') is True
+          PY
+      - name: Run v4 unit and static action tests
+        run: python -m unittest discover -s tests -p 'test_v4*.py' -v
+      - name: Run registered simulation and invariance suite
+        run: |
+          mkdir -p run/acceptance
+          python -m pipeline.v4 acceptance --profile registered \
+            --output run/acceptance/acceptance-report.json
+          python -m pip freeze > run/acceptance/environment-freeze.txt
+          sha256sum requirements-v4.txt > run/acceptance/environment-input.sha256
+      - name: Upload machine-readable acceptance result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: neural-dev-v4-acceptance
+          path: run/acceptance/
+          retention-days: 30
+          if-no-files-found: warn
+
+  prepare:
+    needs: acceptance
+    if: ${{ inputs.mode == 'dev' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      mice: ${{ steps.resolve.outputs.mice }}
+      result_tag: ${{ steps.resolve.outputs.result_tag }}
+      cache_manifest_sha256: ${{ steps.resolve.outputs.cache_manifest_sha256 }}
+      prereg_sha256: ${{ steps.resolve.outputs.prereg_sha256 }}
+      environment_sha256: ${{ steps.resolve.outputs.environment_sha256 }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-v4.txt
+      - run: python -m pip install -r requirements-v4.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-dev-v4-acceptance
+          path: run/acceptance
+      - name: Validate cache and reserve immutable r1 draft
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_TAG: ${{ inputs.time_cache_release }}
+        run: |
+          set -euo pipefail
+          case "$CACHE_TAG" in
+            neural-dev-time-v2-*) ;;
+            *) echo "::error::dev mode requires exact neural-dev-time-v2-* tag"; exit 1 ;;
+          esac
+          test "$(gh release view "$CACHE_TAG" --json isDraft --jq .isDraft)" = false
+          mkdir -p run/input
+          gh release download "$CACHE_TAG" \
+            -p SHA256SUMS -p time-cache-manifest.json \
+            -p time-cache-provenance.json -p time-cache-validation.json \
+            -p dev_experiments.csv -p source-data-package-manifest.json \
+            -p requirements-v4.txt -D run/input
+          (cd run/input && \
+            grep -E '  (time-cache-manifest.json|time-cache-provenance.json|time-cache-validation.json|dev_experiments.csv|source-data-package-manifest.json|requirements-v4.txt)$' SHA256SUMS | \
+            sha256sum --check -)
+          cmp requirements-v4.txt run/input/requirements-v4.txt
+          python -m pip freeze > run/input/environment-freeze.txt
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          cache=json.loads(Path('run/input/time-cache-manifest.json').read_text())
+          validation=json.loads(Path('run/input/time-cache-validation.json').read_text())
+          table=pd.read_csv('run/input/dev_experiments.csv')
+          assert cache['schema']=='neural-dev-time-cache-v2'
+          assert cache['n_active_experiments']==50 and cache['n_passive_experiments']==20
+          assert cache['n_containers']==10 and len(cache['parts'])==10
+          assert cache['active_only'] is True and cache['actual_timestamps'] is True
+          assert cache['contains_fitted_values'] is False
+          assert cache['allen_nwb_download'] is False
+          assert validation['complete'] is True
+          assert len(table)==70 and table.mouse_id.nunique()==10
+          rows=[]
+          for mouse, group in table[table.role.eq('active')].groupby('mouse_id'):
+              containers=group.ophys_container_id.astype(int).unique()
+              assert len(group)==5 and len(containers)==1
+              rows.append({'mouse_id':int(mouse),'container_id':int(containers[0])})
+          assert len(rows)==10
+          Path('run/mice.json').write_text(json.dumps(rows))
+          PY
+          cache_source=$(python -c 'import json; print(json.load(open("run/input/time-cache-manifest.json"))["source_run"])')
+          result_tag="neural-dev-v4-${cache_source}-r1"
+          cache_manifest_sha256=$(sha256sum run/input/time-cache-manifest.json | cut -d' ' -f1)
+          prereg_sha256=$(sha256sum docs/prereg_v4.md | cut -d' ' -f1)
+          environment_sha256=$(sha256sum run/input/environment-freeze.txt | cut -d' ' -f1)
+          mice=$(cat run/mice.json)
+          export cache_manifest_sha256 prereg_sha256 environment_sha256
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          marker={
+              'schema':'neural-dev-v4-draft-v1',
+              'code_commit':os.environ['GITHUB_SHA'],
+              'cache_release':os.environ['CACHE_TAG'],
+              'cache_manifest_sha256':os.environ['cache_manifest_sha256'],
+              'prereg_sha256':os.environ['prereg_sha256'],
+              'environment_sha256':os.environ['environment_sha256'],
+          }
+          Path('run/input/draft-provenance.json').write_text(
+              json.dumps(marker,indent=2)+'\n')
+          PY
+          if gh release view "$result_tag" >/dev/null 2>&1; then
+            test "$(gh release view "$result_tag" --json isDraft --jq .isDraft)" = true || {
+              echo "::error::$result_tag already exists publicly; r1 cannot be overwritten"; exit 1;
+            }
+            mkdir -p run/existing
+            gh release download "$result_tag" -p draft-provenance.json -D run/existing
+            cmp run/input/draft-provenance.json run/existing/draft-provenance.json
+          else
+            gh release create "$result_tag" --target "$GITHUB_SHA" \
+              --title "$result_tag: neural DEV v4" \
+              --notes "Predictive-state causal-history DEV analysis; numeric_sesoi=null; confirm_ready=false." \
+              --latest=false --prerelease --draft
+            gh release upload "$result_tag" run/input/draft-provenance.json
+          fi
+          printf 'mice=%s\nresult_tag=%s\ncache_manifest_sha256=%s\nprereg_sha256=%s\nenvironment_sha256=%s\n' \
+            "$mice" "$result_tag" "$cache_manifest_sha256" "$prereg_sha256" "$environment_sha256" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: neural-dev-v4-input
+          path: run/input/
+          retention-days: 14
+          if-no-files-found: error
+
+  fit_mouse:
+    needs: prepare
+    if: ${{ inputs.mode == 'dev' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.mice) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-v4.txt
+      - run: python -m pip install -r requirements-v4.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-dev-v4-input
+          path: run/input
+      - name: Download one cache container
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_TAG: ${{ inputs.time_cache_release }}
+          CONTAINER: ${{ matrix.container_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p run/download run/cache run/mouse
+          archive="time-cache-container-${CONTAINER}.tar.gz"
+          gh release download "$CACHE_TAG" -p "$archive" -p "${archive}.sha256" -D run/download
+          (cd run/download && sha256sum --check "${archive}.sha256")
+          tar -xzf "run/download/$archive" -C run/cache
+      - name: Fit complete registered mouse shard
+        run: |
+          python -m pip freeze > run/mouse/environment-freeze.txt
+          test "$(sha256sum run/mouse/environment-freeze.txt | cut -d' ' -f1)" = \
+            '${{ needs.prepare.outputs.environment_sha256 }}'
+          python -m pipeline.v4 fit-mouse \
+            --cache run/cache --manifest run/input/dev_experiments.csv \
+            --out run/mouse --mouse-id '${{ matrix.mouse_id }}' \
+            --cache-release '${{ inputs.time_cache_release }}' \
+            --cache-manifest-sha256 '${{ needs.prepare.outputs.cache_manifest_sha256 }}' \
+            --prereg-sha256 '${{ needs.prepare.outputs.prereg_sha256 }}' \
+            --environment-sha256 '${{ needs.prepare.outputs.environment_sha256 }}'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: neural-dev-v4-mouse-${{ matrix.mouse_id }}
+          path: run/mouse/
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+  aggregate:
+    needs: [acceptance, prepare, fit_mouse]
+    if: ${{ inputs.mode == 'dev' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-v4.txt
+      - run: python -m pip install -r requirements-v4.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-dev-v4-input
+          path: run/input
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-dev-v4-acceptance
+          path: run/acceptance
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: neural-dev-v4-mouse-*
+          path: run/mice
+      - name: Aggregate ten immutable mouse shards
+        run: |
+          mkdir -p run/analysis assets
+          python -m pipeline.v4 aggregate \
+            --mouse-results run/mice --manifest run/input/dev_experiments.csv \
+            --out run/analysis --cache-release '${{ inputs.time_cache_release }}' \
+            --cache-manifest-sha256 '${{ needs.prepare.outputs.cache_manifest_sha256 }}' \
+            --prereg-sha256 '${{ needs.prepare.outputs.prereg_sha256 }}' \
+            --environment-sha256 '${{ needs.prepare.outputs.environment_sha256 }}'
+          python - <<'PY'
+          import json
+          result=json.load(open('run/analysis/analysis-manifest.json'))
+          assert result['schema']=='neural-dev-v4'
+          assert result['numeric_sesoi'] is None
+          assert result['confirm_ready'] is False
+          assert result['confirm_data_accessed'] is False
+          assert result['allen_nwb_download'] is False
+          PY
+          tar -czf assets/neural-dev-v4-analysis.tar.gz -C run/analysis .
+          tar -czf assets/neural-dev-v4-mouse-shards.tar.gz -C run/mice .
+          cp docs/prereg_v4.md assets/prereg_v4.md
+          cp run/analysis/analysis-manifest.json run/input/time-cache-manifest.json \
+            run/input/source-data-package-manifest.json run/input/dev_experiments.csv \
+            run/input/time-cache-provenance.json run/input/time-cache-validation.json \
+            run/input/environment-freeze.txt run/input/environment-input.sha256 \
+            run/input/draft-provenance.json assets/
+          cp run/acceptance/acceptance-report.json assets/
+          python - <<'PY'
+          import datetime, json, os
+          from pathlib import Path
+          result=json.loads(Path('assets/analysis-manifest.json').read_text())
+          provenance={
+              'schema':'neural-dev-v4-provenance-v1',
+              'created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'code_commit':os.environ['GITHUB_SHA'],
+              'cache_release':os.environ['CACHE_TAG'],
+              'workflow_run':f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'analysis_status':result['status'],
+              'numeric_sesoi':None,'confirm_ready':False,
+              'confirm_data_accessed':False,'allen_nwb_download':False,
+          }
+          Path('assets/provenance.json').write_text(json.dumps(provenance,indent=2)+'\n')
+          PY
+          (cd assets && sha256sum * > SHA256SUMS)
+        env:
+          CACHE_TAG: ${{ inputs.time_cache_release }}
+      - name: Publish r1 even when the registered result is nonestimable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT_TAG: ${{ needs.prepare.outputs.result_tag }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$RESULT_TAG" --json isDraft --jq .isDraft)" = true
+          gh release upload "$RESULT_TAG" assets/* --clobber
+          gh release edit "$RESULT_TAG" --draft=false --prerelease --latest=false

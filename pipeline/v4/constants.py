@@ -1,0 +1,61 @@
+"""Frozen constants from ``docs/prereg_v4.md``."""
+
+from __future__ import annotations
+
+CACHE_SCHEMA = "neural-dev-time-cache-v2"
+MOUSE_SCHEMA = "neural-dev-v4-mouse-v1"
+RESULT_SCHEMA = "neural-dev-v4"
+
+WINDOW_START = -1.25
+WINDOW_END = 0.75
+RISK_START = 0.15
+RISK_END = 0.75
+
+HMM_K_GRID = (1, 2, 3, 4)
+HMM_SEEDS = tuple(range(4100, 4120))
+HMM_MAX_ITER = 500
+HMM_TOL = 1e-4
+
+CELL_COUNT = 50
+CELL_SEEDS = tuple(range(10))
+BASIS_GRID = (1, 2, 3, 4)
+RIDGE_GRID = tuple(10.0**power for power in range(-4, 3))
+N_BLOCKS = 5
+BOOTSTRAP_REPLICATES = 10_000
+BOOTSTRAP_SEED = 4201
+REQUIRED_MICE = 8
+
+EMISSION_ABORT = 0
+EMISSION_TASK_RESPONSE = 1
+EMISSION_WITHHOLD = 2
+EMISSION_MISSING = 3
+
+CACHE_SUFFIXES = (
+    "time.h5",
+    "trials.parquet",
+    "stim.parquet",
+    "licks.parquet",
+    "rewards.parquet",
+    "eye.parquet",
+    "running.parquet",
+    "meta.json",
+)
+
+TYPED_REASONS = {
+    "source_integrity_failure",
+    "trial_alignment_failure",
+    "invalid_timestamp_grid",
+    "hmm_insufficient_training_sessions",
+    "hmm_inner_candidate_failure",
+    "hmm_no_converged_initialization",
+    "hmm_nonfinite_predictive_posterior",
+    "neural_fewer_than_50_cells",
+    "hazard_no_training_event",
+    "hazard_tuning_insufficient_sessions",
+    "hazard_candidate_failure",
+    "hazard_nonconvergence",
+    "hazard_incomplete_prediction",
+    "hazard_empty_test_block",
+    "nonestimable_mouse_coverage",
+    "not_applicable_k1",
+}
