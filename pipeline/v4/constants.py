@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 CACHE_SCHEMA = "neural-dev-time-cache-v2"
-MOUSE_SCHEMA = "neural-dev-v4-mouse-v1"
+HMM_CHECKPOINT_SCHEMA = "neural-dev-v4-hmm-checkpoint-v1"
+HMM_RELEASE_SCHEMA = "neural-dev-v4-hmm-release-v1"
+MOUSE_SCHEMA = "neural-dev-v4-mouse-v2"
 RESULT_SCHEMA = "neural-dev-v4"
+METHOD_REVISION = "r2"
 
 WINDOW_START = -1.25
 WINDOW_END = 0.75
 RISK_START = 0.15
 RISK_END = 0.75
 
-HMM_K_GRID = (1, 2, 3, 4)
+PRIMARY_HMM_K = 2
+HMM_SENSITIVITY_K = (1, 3)
+HMM_K_GRID = (1, 2, 3)
 HMM_SEEDS = tuple(range(4100, 4120))
 HMM_MAX_ITER = 500
 HMM_TOL = 1e-4
@@ -49,6 +54,9 @@ TYPED_REASONS = {
     "hmm_inner_candidate_failure",
     "hmm_no_converged_initialization",
     "hmm_nonfinite_predictive_posterior",
+    "hmm_backend_failure",
+    "runtime_resource_exhaustion",
+    "checkpoint_integrity_failure",
     "neural_fewer_than_50_cells",
     "hazard_no_training_event",
     "hazard_tuning_insufficient_sessions",

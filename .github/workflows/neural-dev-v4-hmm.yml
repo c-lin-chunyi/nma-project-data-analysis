@@ -1,0 +1,251 @@
+name: build immutable neural DEV v4 HMM checkpoints
+
+run-name: neural DEV v4 HMM r2 · ${{ inputs.time_cache_release }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      time_cache_release:
+        description: 'Exact public neural-dev-time-v2-* tag'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: neural-dev-v4-hmm-r2-${{ inputs.time_cache_release }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  JAX_ENABLE_X64: 'true'
+  XLA_FLAGS: '--xla_force_host_platform_device_count=1'
+  OMP_NUM_THREADS: '1'
+  OPENBLAS_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  NUMEXPR_NUM_THREADS: '1'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      chunks: ${{ steps.resolve.outputs.chunks }}
+      result_tag: ${{ steps.resolve.outputs.result_tag }}
+      cache_manifest_sha256: ${{ steps.resolve.outputs.cache_manifest_sha256 }}
+      prereg_sha256: ${{ steps.resolve.outputs.prereg_sha256 }}
+      environment_sha256: ${{ steps.resolve.outputs.environment_sha256 }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-v4.txt
+      - run: |
+          python -m pip install -r requirements-v4.txt
+          python -m pip check
+          python -m unittest discover -s tests -p 'test_v4*.py' -v
+      - name: Validate time cache and plan bounded fit chunks
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_TAG: ${{ inputs.time_cache_release }}
+        run: |
+          set -euo pipefail
+          case "$CACHE_TAG" in neural-dev-time-v2-*) ;; *) exit 1 ;; esac
+          test "$(gh release view "$CACHE_TAG" --json isDraft --jq .isDraft)" = false
+          mkdir -p run/input
+          gh release download "$CACHE_TAG" \
+            -p SHA256SUMS -p time-cache-manifest.json -p dev_experiments.csv \
+            -p requirements-v4.txt -D run/input
+          (cd run/input && \
+            grep -E '  (time-cache-manifest.json|dev_experiments.csv|requirements-v4.txt)$' SHA256SUMS | \
+            sha256sum --check -)
+          cmp requirements-v4.txt run/input/requirements-v4.txt
+          python -m pip freeze > run/input/environment-freeze.txt
+          python -m pipeline.v4 hmm-plan --manifest run/input/dev_experiments.csv \
+            --max-fit-keys 5 > run/plan-output.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          value=json.loads(Path('run/plan-output.json').read_text())
+          Path('run/input/hmm-plan.json').write_text(json.dumps(value,indent=2)+'\n')
+          PY
+          cache_source=$(python -c 'import json; print(json.load(open("run/input/time-cache-manifest.json"))["source_run"])')
+          result_tag="neural-dev-v4-hmm-${cache_source}-r2"
+          cache_manifest_sha256=$(sha256sum run/input/time-cache-manifest.json | cut -d' ' -f1)
+          prereg_sha256=$(sha256sum docs/prereg_v4.md | cut -d' ' -f1)
+          environment_sha256=$(sha256sum run/input/environment-freeze.txt | cut -d' ' -f1)
+          chunks=$(python -c 'import json; print(json.dumps(json.load(open("run/input/hmm-plan.json"))["chunks"],separators=(",",":")))')
+          export result_tag cache_manifest_sha256 prereg_sha256 environment_sha256
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          marker={
+            'schema':'neural-dev-v4-hmm-draft-v1',
+            'method_revision':'r2',
+            'code_commit':os.environ['GITHUB_SHA'],
+            'cache_release':os.environ['CACHE_TAG'],
+            'cache_manifest_sha256':os.environ['cache_manifest_sha256'],
+            'prereg_sha256':os.environ['prereg_sha256'],
+            'environment_sha256':os.environ['environment_sha256'],
+          }
+          Path('run/input/draft-provenance.json').write_text(json.dumps(marker,indent=2)+'\n')
+          PY
+          if gh release view "$result_tag" >/dev/null 2>&1; then
+            test "$(gh release view "$result_tag" --json isDraft --jq .isDraft)" = true
+            mkdir -p run/existing
+            gh release view "$result_tag" --json assets > run/existing-assets.json
+            endpoint=$(python - <<'PY'
+          import json
+          assets=json.load(open('run/existing-assets.json'))['assets']
+          matches=[a for a in assets if a['name']=='draft-provenance.json']
+          if len(matches)!=1:
+              raise SystemExit(f"expected one draft-provenance.json, found {len(matches)}")
+          print(matches[0]['apiUrl'].removeprefix('https://api.github.com'))
+          PY
+          )
+            gh api -H 'Accept: application/octet-stream' "$endpoint" \
+              > run/existing/draft-provenance.json
+            cmp run/input/draft-provenance.json run/existing/draft-provenance.json
+          else
+            gh release create "$result_tag" --target "$GITHUB_SHA" \
+              --title "$result_tag: fixed-K predictive HMM checkpoints" \
+              --notes "Immutable v4 r2 behavior-only HMM checkpoint layer." \
+              --latest=false --prerelease --draft
+            gh release upload "$result_tag" run/input/draft-provenance.json
+          fi
+          printf 'chunks=%s\nresult_tag=%s\ncache_manifest_sha256=%s\nprereg_sha256=%s\nenvironment_sha256=%s\n' \
+            "$chunks" "$result_tag" "$cache_manifest_sha256" "$prereg_sha256" "$environment_sha256" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: neural-dev-v4-hmm-input
+          path: run/input/
+          retention-days: 30
+
+  fit_chunk:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-v4.txt
+      - run: python -m pip install -r requirements-v4.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-dev-v4-hmm-input
+          path: run/input
+      - name: Download one behavior/cache container
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_TAG: ${{ inputs.time_cache_release }}
+          CONTAINER: ${{ matrix.container_id }}
+        run: |
+          mkdir -p run/download run/cache run/checkpoints
+          archive="time-cache-container-${CONTAINER}.tar.gz"
+          gh release download "$CACHE_TAG" -p "$archive" -p "${archive}.sha256" -D run/download
+          (cd run/download && sha256sum --check "${archive}.sha256")
+          tar -xzf "run/download/$archive" -C run/cache
+      - name: Restore atomic checkpoints from the resumable draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT_TAG: ${{ needs.prepare.outputs.result_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p run/restore
+          asset='hmm-checkpoint-chunk-${{ matrix.mouse_id }}-${{ matrix.chunk_id }}.tar.gz'
+          if gh release download "$RESULT_TAG" -p "$asset" -D run/restore; then
+            tar -xzf "run/restore/$asset" -C run/checkpoints
+          fi
+      - name: Fit at most five fixed-shape keys
+        run: |
+          python -m pipeline.v4 hmm-fit-chunk \
+            --cache run/cache --manifest run/input/dev_experiments.csv \
+            --out run/checkpoints --mouse-id '${{ matrix.mouse_id }}' \
+            --fit-ids '${{ matrix.fit_ids }}' \
+            --cache-release '${{ inputs.time_cache_release }}' \
+            --cache-manifest-sha256 '${{ needs.prepare.outputs.cache_manifest_sha256 }}' \
+            --prereg-sha256 '${{ needs.prepare.outputs.prereg_sha256 }}' \
+            --environment-sha256 '${{ needs.prepare.outputs.environment_sha256 }}' \
+            --code-commit "$GITHUB_SHA"
+      - name: Persist completed atomic fits to the resumable draft
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT_TAG: ${{ needs.prepare.outputs.result_tag }}
+        run: |
+          set -euo pipefail
+          if find run/checkpoints -name fit-manifest.json -print -quit | grep -q .; then
+            asset='hmm-checkpoint-chunk-${{ matrix.mouse_id }}-${{ matrix.chunk_id }}.tar.gz'
+            tar -czf "run/$asset" -C run/checkpoints .
+            gh release upload "$RESULT_TAG" "run/$asset" --clobber
+          fi
+      - name: Upload complete or partial atomic checkpoints
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: neural-dev-v4-hmm-${{ matrix.mouse_id }}-${{ matrix.chunk_id }}
+          path: run/checkpoints/
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: warn
+
+  finalize:
+    needs: [prepare, fit_chunk]
+    if: ${{ needs.fit_chunk.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-v4.txt
+      - run: python -m pip install -r requirements-v4.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-dev-v4-hmm-input
+          path: run/input
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: neural-dev-v4-hmm-*-*
+          path: run/checkpoints
+      - name: Verify complete checkpoint universe and publish r2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT_TAG: ${{ needs.prepare.outputs.result_tag }}
+        run: |
+          mkdir -p run/release assets
+          python -m pipeline.v4 hmm-verify \
+            --checkpoints run/checkpoints --manifest run/input/dev_experiments.csv \
+            --out run/release --cache-release '${{ inputs.time_cache_release }}' \
+            --cache-manifest-sha256 '${{ needs.prepare.outputs.cache_manifest_sha256 }}' \
+            --prereg-sha256 '${{ needs.prepare.outputs.prereg_sha256 }}' \
+            --environment-sha256 '${{ needs.prepare.outputs.environment_sha256 }}' \
+            --code-commit "$GITHUB_SHA"
+          tar -czf assets/neural-dev-v4-hmm-checkpoints.tar.gz -C run/release .
+          cp run/release/hmm-release-manifest.json run/release/behavior_sensitivity.parquet \
+            run/input/dev_experiments.csv run/input/draft-provenance.json assets/
+          (cd assets && sha256sum * > SHA256SUMS)
+          test "$(gh release view "$RESULT_TAG" --json isDraft --jq .isDraft)" = true
+          gh release upload "$RESULT_TAG" assets/* --clobber
+          gh release view "$RESULT_TAG" --json assets \
+            --jq '.assets[].name | select(startswith("hmm-checkpoint-chunk-"))' |
+            while read -r asset; do
+              gh release delete-asset "$RESULT_TAG" "$asset" --yes
+            done
+          gh release edit "$RESULT_TAG" --draft=false --prerelease --latest=false

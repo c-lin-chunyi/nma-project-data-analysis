@@ -9,6 +9,7 @@ from pathlib import Path
 from .acceptance import run_acceptance
 from .analysis import aggregate, fit_mouse
 from .cache import materialize_container, verify_cache
+from .hmm_checkpoint import fit_chunk, plan_chunks, verify_release
 
 
 def _path(value: str) -> Path:
@@ -35,6 +36,32 @@ def _parser() -> argparse.ArgumentParser:
     acceptance = commands.add_parser("acceptance")
     acceptance.add_argument("--output", required=True, type=_path)
 
+    hmm_plan = commands.add_parser("hmm-plan")
+    hmm_plan.add_argument("--manifest", required=True, type=_path)
+    hmm_plan.add_argument("--max-fit-keys", default=5, type=int)
+
+    hmm_chunk = commands.add_parser("hmm-fit-chunk")
+    hmm_chunk.add_argument("--cache", required=True, type=_path)
+    hmm_chunk.add_argument("--manifest", required=True, type=_path)
+    hmm_chunk.add_argument("--out", required=True, type=_path)
+    hmm_chunk.add_argument("--mouse-id", required=True, type=int)
+    hmm_chunk.add_argument("--fit-ids", required=True)
+    hmm_chunk.add_argument("--cache-release", required=True)
+    hmm_chunk.add_argument("--cache-manifest-sha256", required=True)
+    hmm_chunk.add_argument("--prereg-sha256", required=True)
+    hmm_chunk.add_argument("--environment-sha256", required=True)
+    hmm_chunk.add_argument("--code-commit", required=True)
+
+    hmm_verify = commands.add_parser("hmm-verify")
+    hmm_verify.add_argument("--checkpoints", required=True, type=_path)
+    hmm_verify.add_argument("--manifest", required=True, type=_path)
+    hmm_verify.add_argument("--out", required=True, type=_path)
+    hmm_verify.add_argument("--cache-release", required=True)
+    hmm_verify.add_argument("--cache-manifest-sha256", required=True)
+    hmm_verify.add_argument("--prereg-sha256", required=True)
+    hmm_verify.add_argument("--environment-sha256", required=True)
+    hmm_verify.add_argument("--code-commit", required=True)
+
     mouse = commands.add_parser("fit-mouse")
     mouse.add_argument("--cache", required=True, type=_path)
     mouse.add_argument("--manifest", required=True, type=_path)
@@ -44,6 +71,9 @@ def _parser() -> argparse.ArgumentParser:
     mouse.add_argument("--cache-manifest-sha256", required=True)
     mouse.add_argument("--prereg-sha256", required=True)
     mouse.add_argument("--environment-sha256", required=True)
+    mouse.add_argument("--hmm-checkpoints", required=True, type=_path)
+    mouse.add_argument("--hmm-release", required=True)
+    mouse.add_argument("--hmm-manifest-sha256", required=True)
 
     combined = commands.add_parser("aggregate")
     combined.add_argument("--mouse-results", required=True, type=_path)
@@ -53,6 +83,8 @@ def _parser() -> argparse.ArgumentParser:
     combined.add_argument("--cache-manifest-sha256", required=True)
     combined.add_argument("--prereg-sha256", required=True)
     combined.add_argument("--environment-sha256", required=True)
+    combined.add_argument("--hmm-release", required=True)
+    combined.add_argument("--hmm-manifest-sha256", required=True)
     return parser
 
 
@@ -71,6 +103,34 @@ def main(argv: list[str] | None = None) -> int:
         result = verify_cache(args.cache, args.manifest, args.report)
     elif args.command == "acceptance":
         result = run_acceptance(args.output)
+    elif args.command == "hmm-plan":
+        result = plan_chunks(
+            args.manifest, max_fit_keys=args.max_fit_keys
+        )
+    elif args.command == "hmm-fit-chunk":
+        result = fit_chunk(
+            args.cache,
+            args.manifest,
+            args.out,
+            mouse_id=args.mouse_id,
+            fit_ids=args.fit_ids.split(","),
+            cache_release=args.cache_release,
+            cache_manifest_sha256=args.cache_manifest_sha256,
+            prereg_sha256=args.prereg_sha256,
+            environment_sha256=args.environment_sha256,
+            code_commit=args.code_commit,
+        )
+    elif args.command == "hmm-verify":
+        result = verify_release(
+            args.checkpoints,
+            args.manifest,
+            args.out,
+            cache_release=args.cache_release,
+            cache_manifest_sha256=args.cache_manifest_sha256,
+            prereg_sha256=args.prereg_sha256,
+            environment_sha256=args.environment_sha256,
+            code_commit=args.code_commit,
+        )
     elif args.command == "fit-mouse":
         result = fit_mouse(
             args.cache,
@@ -81,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
             cache_manifest_sha256=args.cache_manifest_sha256,
             prereg_sha256=args.prereg_sha256,
             environment_sha256=args.environment_sha256,
+            hmm_checkpoints=args.hmm_checkpoints,
+            hmm_release=args.hmm_release,
+            hmm_manifest_sha256=args.hmm_manifest_sha256,
         )
     else:
         result = aggregate(
@@ -91,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
             cache_manifest_sha256=args.cache_manifest_sha256,
             prereg_sha256=args.prereg_sha256,
             environment_sha256=args.environment_sha256,
+            hmm_release=args.hmm_release,
+            hmm_manifest_sha256=args.hmm_manifest_sha256,
         )
     print(json.dumps(result, sort_keys=True))
     return 0

@@ -397,8 +397,147 @@ class AggregateAndWorkflowTests(unittest.TestCase):
                     side_effect=fake_read_session,
                 ),
                 patch(
-                    "pipeline.v4.analysis.select_target_hmm",
+                    "pipeline.v4.analysis.load_target_posteriors",
                     side_effect=ValueError("no_hazard_event"),
+                ),
+            ):
+                hmm = root / "hmm"
+                hmm.mkdir()
+                hmm_manifest = {
+                    "schema": "neural-dev-v4-hmm-release-v1",
+                    "method_revision": "r2",
+                    "primary_k": 2,
+                    "k_selection_performed": False,
+                    "cache_release": "cache",
+                    "cache_manifest_sha256": "c",
+                    "prereg_sha256": "p",
+                    "environment_sha256": "e",
+                }
+                hmm_manifest_path = hmm / "hmm-release-manifest.json"
+                hmm_manifest_path.write_text(json.dumps(hmm_manifest) + "\n")
+                pd.DataFrame(
+                    columns=[
+                        "mouse_id",
+                        "target_session",
+                        "k1_per_trial_loglik",
+                        "k2_per_trial_loglik",
+                        "k3_per_trial_loglik",
+                        "k2_minus_k1",
+                        "k3_minus_k2",
+                    ]
+                ).to_parquet(hmm / "behavior_sensitivity.parquet", index=False)
+                result = fit_mouse(
+                    root / "cache",
+                    manifest_path,
+                    root / "mouse",
+                    mouse_id=mouse_id,
+                    cache_release="cache",
+                    cache_manifest_sha256="c",
+                    prereg_sha256="p",
+                    environment_sha256="e",
+                    hmm_checkpoints=hmm,
+                    hmm_release="hmm",
+                    hmm_manifest_sha256=hashlib.sha256(
+                        hmm_manifest_path.read_bytes()
+                    ).hexdigest(),
+                )
+
+            self.assertEqual(result["n_expected_sessions"], 3)
+            self.assertEqual(len(result["failures"]), 3)
+            self.assertFalse(result["confirm_ready"])
+
+    def test_k1_sensitivity_failure_does_not_change_primary_status(self):
+        manifest = _uneven_source_manifest()
+        mouse_id = 3_001
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.csv"
+            manifest.to_csv(manifest_path, index=False)
+
+            def fake_read_session(_cache, row):
+                return {
+                    "experiment_id": int(row.ophys_experiment_id),
+                    "behavior_session_id": int(row.behavior_session_id),
+                    "mouse_id": int(row.mouse_id),
+                    "behavior": pd.DataFrame([{"trial_id_v4": 0}]),
+                    "cells": np.array([], dtype=np.int64),
+                    "neural": {},
+                }
+
+            def fake_posteriors(
+                _release, *, mouse_id, target_session, tuning_sessions
+            ):
+                return np.array([[0.4, 0.6]]), {
+                    session_id: np.array([[0.5, 0.5]])
+                    for session_id in tuning_sessions
+                }
+
+            def fake_tune(_target, target_hmm, _sessions, *, model):
+                if target_hmm.selected_k == 1:
+                    raise ValueError("hazard_no_training_event")
+                return (None if model == "M0" else 1), 1.0, []
+
+            def fake_evaluate(target, _hmm, *, selected, **_kwargs):
+                return (
+                    [
+                        {
+                            "mouse_id": int(target["mouse_id"]),
+                            "behavior_session_id": int(
+                                target["behavior_session_id"]
+                            ),
+                            "cell_seed": 0,
+                            "n_evaluated_trials": 1,
+                            "delta_ll": 0.0,
+                            "m2_minus_m1": 0.0,
+                            "dff_delta_ll": 0.0,
+                            "status": "estimable",
+                            "reason": None,
+                        }
+                    ],
+                    [],
+                    [],
+                )
+
+            hmm = root / "hmm"
+            hmm.mkdir()
+            hmm_manifest = {
+                "schema": "neural-dev-v4-hmm-release-v1",
+                "method_revision": "r2",
+                "primary_k": 2,
+                "k_selection_performed": False,
+                "cache_release": "cache",
+                "cache_manifest_sha256": "c",
+                "prereg_sha256": "p",
+                "environment_sha256": "e",
+            }
+            hmm_manifest_path = hmm / "hmm-release-manifest.json"
+            hmm_manifest_path.write_text(json.dumps(hmm_manifest) + "\n")
+            pd.DataFrame(
+                [
+                    {
+                        "mouse_id": mouse_id,
+                        "target_session": 1,
+                        "k2_minus_k1": 0.0,
+                        "k3_minus_k2": 0.0,
+                    }
+                ]
+            ).to_parquet(hmm / "behavior_sensitivity.parquet", index=False)
+            with (
+                patch(
+                    "pipeline.v4.analysis._read_session",
+                    side_effect=fake_read_session,
+                ),
+                patch(
+                    "pipeline.v4.analysis.load_target_posteriors",
+                    side_effect=fake_posteriors,
+                ),
+                patch(
+                    "pipeline.v4.analysis._tune_model",
+                    side_effect=fake_tune,
+                ),
+                patch(
+                    "pipeline.v4.analysis._evaluate_target",
+                    side_effect=fake_evaluate,
                 ),
             ):
                 result = fit_mouse(
@@ -410,11 +549,21 @@ class AggregateAndWorkflowTests(unittest.TestCase):
                     cache_manifest_sha256="c",
                     prereg_sha256="p",
                     environment_sha256="e",
+                    hmm_checkpoints=hmm,
+                    hmm_release="hmm",
+                    hmm_manifest_sha256=hashlib.sha256(
+                        hmm_manifest_path.read_bytes()
+                    ).hexdigest(),
                 )
-
-            self.assertEqual(result["n_expected_sessions"], 3)
+            self.assertEqual(result["n_estimable_sessions"], 3)
+            self.assertEqual(result["status"], "estimable")
             self.assertEqual(len(result["failures"]), 3)
-            self.assertFalse(result["confirm_ready"])
+            self.assertTrue(
+                all(
+                    row["analysis"] == "sensitivity_k1_no_state"
+                    for row in result["failures"]
+                )
+            )
 
     def test_aggregate_eight_mouse_coverage_and_closed_confirm(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -437,12 +586,17 @@ class AggregateAndWorkflowTests(unittest.TestCase):
                 (shard / "mouse-manifest.json").write_text(
                     json.dumps(
                         {
-                            "schema": "neural-dev-v4-mouse-v1",
+                            "schema": "neural-dev-v4-mouse-v2",
+                            "method_revision": "r2",
+                            "primary_k": 2,
+                            "k_selection_performed": False,
                             "mouse_id": mouse,
                             "cache_release": "cache",
                             "cache_manifest_sha256": "c",
                             "prereg_sha256": "p",
                             "environment_sha256": "e",
+                            "hmm_release": "hmm",
+                            "hmm_manifest_sha256": "h",
                             "diagnostics_complete": True,
                         }
                     )
@@ -477,6 +631,22 @@ class AggregateAndWorkflowTests(unittest.TestCase):
                         }
                     )
                 pd.DataFrame(seed_rows).to_parquet(shard / "session_seeds.parquet")
+                pd.DataFrame(seed_rows).to_parquet(
+                    shard / "k1_hazard_sensitivity.parquet"
+                )
+                pd.DataFrame(
+                    [
+                        {
+                            "mouse_id": mouse,
+                            "target_session": mouse * 7,
+                            "k1_per_trial_loglik": -1.2,
+                            "k2_per_trial_loglik": -1.1,
+                            "k3_per_trial_loglik": -1.0,
+                            "k2_minus_k1": 0.1,
+                            "k3_minus_k2": 0.1,
+                        }
+                    ]
+                ).to_parquet(shard / "behavior_sensitivity.parquet", index=False)
             manifest = root / "manifest.csv"
             pd.DataFrame(rows).to_csv(manifest, index=False)
             result = aggregate(
@@ -487,6 +657,8 @@ class AggregateAndWorkflowTests(unittest.TestCase):
                 cache_manifest_sha256="c",
                 prereg_sha256="p",
                 environment_sha256="e",
+                hmm_release="hmm",
+                hmm_manifest_sha256="h",
             )
             self.assertEqual(result["coverage"]["estimable_mice"], 8)
             self.assertTrue(result["v4_1_eligible"])
@@ -518,6 +690,8 @@ class AggregateAndWorkflowTests(unittest.TestCase):
                 cache_manifest_sha256="c",
                 prereg_sha256="p",
                 environment_sha256="e",
+                hmm_release="hmm",
+                hmm_manifest_sha256="h",
             )
             self.assertEqual(nonestimable["status"], "nonestimable_mouse_coverage")
             self.assertEqual(nonestimable["coverage"]["estimable_mice"], 0)
@@ -538,7 +712,20 @@ class AggregateAndWorkflowTests(unittest.TestCase):
         self.assertIn("Run implementation invariance suite", v4_action)
         self.assertNotIn("--profile registered", v4_action)
         self.assertNotIn("registered simulation", v4_action.lower())
-        self.assertIn("already exists publicly; r1 cannot be overwritten", v4_action)
+        self.assertIn("already exists publicly; r2 cannot be overwritten", v4_action)
+        hmm_action = (ROOT / ".github/workflows/neural-dev-v4-hmm.yml").read_text()
+        yaml.safe_load(hmm_action)
+        self.assertIn("neural-dev-v4-hmm-", hmm_action)
+        self.assertIn("--max-fit-keys 5", hmm_action)
+        self.assertIn("if: always()", hmm_action)
+        self.assertIn(
+            "Restore atomic checkpoints from the resumable draft", hmm_action
+        )
+        self.assertIn(
+            "Persist completed atomic fits to the resumable draft", hmm_action
+        )
+        self.assertIn("hmm-checkpoint-chunk-", hmm_action)
+        self.assertIn("hmm_checkpoint_release", v4_action)
         self.assertIn("key=lambda part: part['name']", cache_action)
         self.assertIn("download_draft_asset", cache_action)
         self.assertIn("Accept: application/octet-stream", cache_action)
@@ -557,8 +744,9 @@ class AggregateAndWorkflowTests(unittest.TestCase):
             v4_action,
         )
         self.assertNotIn("len(group)==5", v4_action)
-        self.assertNotIn(".nwb", cache_action.lower() + v4_action.lower())
-        self.assertNotIn("allensdk", cache_action.lower() + v4_action.lower())
+        action_text = (cache_action + v4_action + hmm_action).lower()
+        self.assertNotIn(".nwb", action_text)
+        self.assertNotIn("allensdk", action_text)
         prereg = (ROOT / "docs/prereg_v4.md").read_text()
         self.assertIn("**Status:** DRAFT", prereg)
         self.assertNotIn("TODO", prereg)

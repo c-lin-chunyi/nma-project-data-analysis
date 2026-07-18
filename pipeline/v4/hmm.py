@@ -11,10 +11,10 @@ import numpy as np
 from .behavior import hmm_design
 from .constants import (
     EMISSION_MISSING,
-    HMM_K_GRID,
     HMM_MAX_ITER,
     HMM_SEEDS,
     HMM_TOL,
+    PRIMARY_HMM_K,
 )
 
 
@@ -55,7 +55,6 @@ def make_masked_model(num_states: int, input_dim: int):
             self._masked_batch_e_jit = jax.jit(
                 jax.vmap(self.masked_e_step, in_axes=(None, 0, 0, 0, 0))
             )
-            self._masked_single_e_jit = jax.jit(self.masked_e_step)
 
         def masked_e_step(
             self, params, emissions, inputs, structural_mask, observed_mask
@@ -77,18 +76,16 @@ def make_masked_model(num_states: int, input_dim: int):
             )
             posterior = smoother(pi0, transition, likelihoods)
 
-            if posterior.trans_probs.ndim == 2:
-                # Dynamax pre-sums pairwise probabilities for homogeneous
-                # transitions. This branch is exact only for an unpadded
-                # session; padded batched values are replaced below.
-                transition_probs = posterior.trans_probs
-            else:
-                structural_transition = (
-                    structural_mask[:-1] & structural_mask[1:]
-                )[:, None, None]
-                transition_probs = jnp.where(
-                    structural_transition, posterior.trans_probs, 0.0
-                ).sum(axis=0)
+            # Broadcasting the stationary transition matrix above forces
+            # Dynamax to return time-resolved pairwise probabilities.  Masking
+            # them here makes trailing padding and wholly dummy sessions exact
+            # zero contributors without compiling an exact-length E-step.
+            structural_transition = (
+                structural_mask[:-1] & structural_mask[1:]
+            )[:, None, None]
+            transition_probs = jnp.where(
+                structural_transition, posterior.trans_probs, 0.0
+            ).sum(axis=0)
             transition_post = posterior._replace(trans_probs=transition_probs)
             emission_post = posterior._replace(
                 smoothed_probs=jnp.where(
@@ -99,6 +96,10 @@ def make_masked_model(num_states: int, input_dim: int):
             )
             initial_stats = self.initial_component.collect_suff_stats(
                 params.initial, posterior, inputs
+            )
+            initial_stats = jax.tree_util.tree_map(
+                lambda value: jnp.where(structural_mask[0], value, 0.0),
+                initial_stats,
             )
             transition_stats = self.transition_component.collect_suff_stats(
                 params.transitions, transition_post, inputs
@@ -129,17 +130,33 @@ class HMMFit:
     all_starts: list[dict] = field(default_factory=list)
 
 
+class HMMNoConvergence(ValueError):
+    """All registered starts completed without meeting convergence."""
+
+    def __init__(self, starts: Sequence[HMMFit]):
+        super().__init__("hmm_no_converged_initialization")
+        self.starts = tuple(starts)
+
+
 def _pad_sessions(
-    emissions: Sequence[np.ndarray], designs: Sequence[np.ndarray]
+    emissions: Sequence[np.ndarray],
+    designs: Sequence[np.ndarray],
+    *,
+    batch_size: int | None = None,
+    time_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if not emissions:
         raise ValueError("at least one session is required")
     maximum = max(map(len, emissions))
+    batch_size = len(emissions) if batch_size is None else int(batch_size)
+    time_size = maximum if time_size is None else int(time_size)
+    if batch_size < len(emissions) or time_size < maximum:
+        raise ValueError("fixed HMM shape is smaller than observed sessions")
     dimension = designs[0].shape[1]
-    y = np.full((len(emissions), maximum), EMISSION_MISSING, np.int32)
-    x = np.zeros((len(emissions), maximum, dimension), np.float64)
-    structural = np.zeros((len(emissions), maximum), bool)
-    observed = np.zeros((len(emissions), maximum), bool)
+    y = np.full((batch_size, time_size), EMISSION_MISSING, np.int32)
+    x = np.zeros((batch_size, time_size, dimension), np.float64)
+    structural = np.zeros((batch_size, time_size), bool)
+    observed = np.zeros((batch_size, time_size), bool)
     for index, (session_y, session_x) in enumerate(zip(emissions, designs)):
         length = len(session_y)
         y[index, :length] = session_y
@@ -158,6 +175,7 @@ def _fit_one_start(
     max_iter: int,
     tolerance: float,
     model=None,
+    fixed_shape: tuple[int, int] | None = None,
 ) -> HMMFit:
     jax, jnp, jr, _, _, _ = _jax_modules()
     model = model if model is not None else make_masked_model(k, designs[0].shape[1])
@@ -175,7 +193,14 @@ def _fit_one_start(
     params, props = model.initialize(
         jr.PRNGKey(seed), method="prior", **initialize_kwargs
     )
-    y, x, structural, observed = _pad_sessions(emissions, designs)
+    shape_kwargs = (
+        {}
+        if fixed_shape is None
+        else {"batch_size": fixed_shape[0], "time_size": fixed_shape[1]}
+    )
+    y, x, structural, observed = _pad_sessions(
+        emissions, designs, **shape_kwargs
+    )
     yj, xj = jnp.asarray(y), jnp.asarray(x, dtype=jnp.float64)
     sj, oj = jnp.asarray(structural), jnp.asarray(observed)
     m_state = model.initialize_m_step_state(params, props)
@@ -183,21 +208,6 @@ def _fit_one_start(
     converged_steps = 0
     for _ in range(max_iter):
         stats, likelihoods = model._masked_batch_e_jit(params, yj, xj, sj, oj)
-        # The homogeneous-transition smoother returns pairwise probabilities
-        # already summed over time, so padding cannot be removed afterwards.
-        # Recompute only that small statistic on each exact-length session.
-        transition_stats = []
-        for session_y, session_x in zip(emissions, designs):
-            length = len(session_y)
-            exact_stats, _ = model._masked_single_e_jit(
-                params,
-                jnp.asarray(session_y, dtype=jnp.int32),
-                jnp.asarray(session_x, dtype=jnp.float64),
-                jnp.ones(length, dtype=bool),
-                jnp.asarray(session_y != EMISSION_MISSING),
-            )
-            transition_stats.append(exact_stats[1])
-        stats = (stats[0], jnp.stack(transition_stats), stats[2])
         value = float(jnp.sum(likelihoods))
         if not np.isfinite(value):
             break
@@ -208,7 +218,7 @@ def _fit_one_start(
             converged_steps = 0
         if converged_steps >= 2:
             break
-        params, m_state = model.m_step(params, props, stats, m_state)
+        params, m_state = model._m_step_jit(params, props, stats, m_state)
     return HMMFit(
         model=model,
         params=params,
@@ -228,6 +238,7 @@ def fit_hmm(
     seeds: Sequence[int] = HMM_SEEDS,
     max_iter: int = HMM_MAX_ITER,
     tolerance: float = HMM_TOL,
+    fixed_shape: tuple[int, int] | None = None,
 ) -> HMMFit:
     """Fit all registered starts and retain the best converged data likelihood."""
 
@@ -263,6 +274,7 @@ def fit_hmm(
             max_iter=max_iter,
             tolerance=tolerance,
             model=model,
+            fixed_shape=fixed_shape,
         )
         for seed in seeds
     ]
@@ -270,7 +282,7 @@ def fit_hmm(
         fit for fit in fits if fit.converged and np.isfinite(fit.marginal_loglik)
     ]
     if not converged:
-        raise ValueError("hmm_no_converged_initialization")
+        raise HMMNoConvergence(fits)
     best = max(converged, key=lambda fit: fit.marginal_loglik)
     best.scaler = scaler
     best.training_session_ids = tuple(map(int, session_ids))
@@ -378,12 +390,20 @@ def select_target_hmm(
     max_iter: int = HMM_MAX_ITER,
     tolerance: float = HMM_TOL,
 ) -> TargetHMM:
-    """Nested leave-one-session-out K selection for one target session."""
+    """Build the fixed-K primary target and nested tuning posteriors.
+
+    The historical name is retained as an internal compatibility shim.  r2
+    never selects K: every primary call uses ``PRIMARY_HMM_K``.
+    """
 
     fit_cache = fit_cache if fit_cache is not None else {}
     outer_ids = sorted(set(sessions) - {int(target_session)})
-    if len(outer_ids) < 3:
+    if len(outer_ids) < 2:
         raise ValueError("hmm_insufficient_training_sessions")
+    fixed_shape = (
+        len(sessions) - 1,
+        max(len(frame) for frame in sessions.values()),
+    )
 
     def cached_fit(training_ids: Sequence[int], k: int) -> HMMFit:
         key = (
@@ -400,46 +420,22 @@ def select_target_hmm(
                 seeds=seeds,
                 max_iter=max_iter,
                 tolerance=tolerance,
+                fixed_shape=fixed_shape,
             )
         return fit_cache[key]
 
-    scores: dict[int, list[float]] = {k: [] for k in HMM_K_GRID}
-    inner_fits: dict[tuple[int, int], HMMFit] = {}
-    selection_rows: list[dict] = []
-    for k in HMM_K_GRID:
-        for heldout in outer_ids:
-            training_ids = [session_id for session_id in outer_ids if session_id != heldout]
-            fit = cached_fit(training_ids, k)
-            inner_fits[(k, heldout)] = fit
-            score = marginal_loglik(fit, sessions[heldout]) / len(sessions[heldout])
-            scores[k].append(score)
-            selection_rows.append(
-                {
-                    "target_session": int(target_session),
-                    "heldout_session": int(heldout),
-                    "k": int(k),
-                    "per_trial_loglik": float(score),
-                }
-            )
-    means = {k: float(np.mean(values)) for k, values in scores.items()}
-    errors = {
-        k: float(np.std(values, ddof=1) / np.sqrt(len(values)))
-        for k, values in scores.items()
-    }
-    selected = one_se_smallest(means, errors)
-    for row in selection_rows:
-        row.update(
-            mean=means[row["k"]],
-            standard_error=errors[row["k"]],
-            selected=row["k"] == selected,
-        )
+    selected = PRIMARY_HMM_K
+    inner_fits: dict[int, HMMFit] = {}
+    for heldout in outer_ids:
+        training_ids = [session_id for session_id in outer_ids if session_id != heldout]
+        if not training_ids:
+            raise ValueError("hmm_insufficient_training_sessions")
+        inner_fits[heldout] = cached_fit(training_ids, selected)
 
     final = cached_fit(outer_ids, selected)
     target_probs = predictive_state_probs(final, sessions[target_session])
     inner_probs = {
-        heldout: predictive_state_probs(
-            inner_fits[(selected, heldout)], sessions[heldout]
-        )
+        heldout: predictive_state_probs(inner_fits[heldout], sessions[heldout])
         for heldout in outer_ids
     }
     used_fits = {id(final): final}
@@ -463,6 +459,13 @@ def select_target_hmm(
         final_fit=final,
         target_probs=target_probs,
         inner_probs=inner_probs,
-        selection_rows=selection_rows,
+        selection_rows=[
+            {
+                "target_session": int(target_session),
+                "k": int(PRIMARY_HMM_K),
+                "selected": True,
+                "selection_performed": False,
+            }
+        ],
         start_rows=start_rows,
     )

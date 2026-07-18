@@ -51,12 +51,13 @@ alter the v1–v3 analysis environments. Run the Actions in this order:
 1. **build immutable neural DEV time-cache-v2** with one exact public
    `neural-dev-data-*` tag. It publishes the active-only, actual-frame cache as
    `neural-dev-time-v2-<source-run>`.
-2. Run **neural DEV v4 predictive-state hazard analysis** in `dev` mode with
-   the exact public time-cache tag. The workflow first runs dependency, unit,
-   static, and future-information invariance acceptance without parameter-
-   recovery simulation. Ten mouse jobs are then aggregated into the immutable
-   prerelease `neural-dev-v4-<cache-source>-r1`. The `acceptance` mode remains
-   available as an implementation-only dry run and makes no analysis Release.
+2. Run **build immutable neural DEV v4 HMM checkpoints** with the exact public
+   time-cache tag. Fixed-shape K=2 primary and K=1/K=3 sensitivity fits publish
+   `neural-dev-v4-hmm-<cache-source>-r2`.
+3. Run **neural DEV v4 predictive-state hazard analysis** in `dev` mode with
+   both exact public tags. It consumes, but never refits, the HMM checkpoints
+   and publishes `neural-dev-v4-<cache-source>-r2`. The `acceptance` mode remains
+   an implementation-only dry run and makes no analysis Release.
 
 A statistically nonestimable DEV result is still a valid v4 release. Pipeline
 or integrity failures prevent publication. Every v4 result keeps

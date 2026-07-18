@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+from types import SimpleNamespace
 from dataclasses import asdict
 from pathlib import Path
 from typing import Mapping
@@ -12,7 +13,7 @@ from typing import Mapping
 import numpy as np
 import pandas as pd
 
-from .behavior import HMM_FEATURE_NAMES, compile_behavior
+from .behavior import compile_behavior
 from .constants import (
     BASIS_GRID,
     BOOTSTRAP_REPLICATES,
@@ -20,6 +21,8 @@ from .constants import (
     CACHE_SCHEMA,
     CELL_SEEDS,
     MOUSE_SCHEMA,
+    METHOD_REVISION,
+    PRIMARY_HMM_K,
     REQUIRED_MICE,
     RESULT_SCHEMA,
     RIDGE_GRID,
@@ -31,7 +34,7 @@ from .hazard import (
     load_neural_trials,
     one_se_hazard,
 )
-from .hmm import select_target_hmm, state_order
+from .hmm_checkpoint import load_target_posteriors
 
 
 def _sha256(path: Path) -> str:
@@ -41,7 +44,13 @@ def _sha256(path: Path) -> str:
 
 
 def _typed_reason(exc: Exception) -> str:
+    if isinstance(exc, MemoryError):
+        return "runtime_resource_exhaustion"
     message = str(exc)
+    if "Cannot allocate memory" in message or "std::bad_alloc" in message:
+        return "runtime_resource_exhaustion"
+    if type(exc).__name__ in {"XlaRuntimeError", "JaxRuntimeError"}:
+        return "hmm_backend_failure"
     for reason in TYPED_REASONS:
         if message == reason or message.startswith(reason + ":"):
             return reason
@@ -151,6 +160,8 @@ def _evaluate_target(
     target_hmm,
     *,
     selected: Mapping[str, tuple[int | None, float]],
+    include_dff: bool = True,
+    analysis_label: str = "primary_k2",
 ) -> tuple[list[dict], list[dict], list[dict]]:
     seed_rows: list[dict] = []
     block_rows: list[dict] = []
@@ -180,6 +191,7 @@ def _evaluate_target(
                 "model": "M0",
                 "signal": "events",
                 "cell_seed": np.nan,
+                "analysis": analysis_label,
             }
         )
     for row in coefficients:
@@ -189,6 +201,7 @@ def _evaluate_target(
                 "behavior_session_id": target["behavior_session_id"],
                 "signal": "events",
                 "cell_seed": np.nan,
+                "analysis": analysis_label,
             }
         )
 
@@ -211,23 +224,25 @@ def _evaluate_target(
         )
         if n_trials != m0_trials:
             raise ValueError("hazard_incomplete_prediction")
-        dff_risk = build_risk_rows(
-            target["behavior"],
-            target_hmm.target_probs,
-            target["neural"],
-            experiment_id=target["experiment_id"],
-            seed=seed,
-            basis_count=int(m1_basis),
-            signal="dff",
-        )
-        dff_m1, dff_trials, dff_blocks, dff_coefficients = evaluate_prequential(
-            dff_risk,
-            n_raw_trials=len(target["behavior"]),
-            model="M1",
-            penalty=m1_penalty,
-        )
-        if dff_trials != m0_trials:
-            raise ValueError("hazard_incomplete_prediction")
+        dff_m1, dff_blocks, dff_coefficients = np.nan, [], []
+        if include_dff:
+            dff_risk = build_risk_rows(
+                target["behavior"],
+                target_hmm.target_probs,
+                target["neural"],
+                experiment_id=target["experiment_id"],
+                seed=seed,
+                basis_count=int(m1_basis),
+                signal="dff",
+            )
+            dff_m1, dff_trials, dff_blocks, dff_coefficients = evaluate_prequential(
+                dff_risk,
+                n_raw_trials=len(target["behavior"]),
+                model="M1",
+                penalty=m1_penalty,
+            )
+            if dff_trials != m0_trials:
+                raise ValueError("hazard_incomplete_prediction")
         m2 = np.nan
         m2_status = "not_applicable_k1"
         if target_hmm.selected_k > 1:
@@ -258,6 +273,7 @@ def _evaluate_target(
                         "model": "M2",
                         "signal": "events",
                         "cell_seed": seed,
+                        "analysis": analysis_label,
                     }
                 )
             for row in m2_coefficients:
@@ -267,6 +283,7 @@ def _evaluate_target(
                         "behavior_session_id": target["behavior_session_id"],
                         "signal": "events",
                         "cell_seed": seed,
+                        "analysis": analysis_label,
                     }
                 )
         seed_rows.append(
@@ -287,6 +304,7 @@ def _evaluate_target(
                 "dff_delta_ll": dff_m1 - m0,
                 "status": "estimable",
                 "reason": None,
+                "analysis": analysis_label,
             }
         )
         for signal, source_blocks, source_coefficients in (
@@ -301,6 +319,7 @@ def _evaluate_target(
                         "model": "M1",
                         "signal": signal,
                         "cell_seed": seed,
+                        "analysis": analysis_label,
                     }
                 )
             for row in source_coefficients:
@@ -310,6 +329,7 @@ def _evaluate_target(
                         "behavior_session_id": target["behavior_session_id"],
                         "signal": signal,
                         "cell_seed": seed,
+                        "analysis": analysis_label,
                     }
                 )
     return seed_rows, block_rows, coefficient_rows
@@ -329,6 +349,9 @@ def fit_mouse(
     cache_manifest_sha256: str,
     prereg_sha256: str,
     environment_sha256: str,
+    hmm_checkpoints: Path,
+    hmm_release: str,
+    hmm_manifest_sha256: str,
     hmm_seeds=None,
     hmm_max_iter=None,
 ) -> dict:
@@ -343,6 +366,22 @@ def fit_mouse(
     sessions_by_id = {item["behavior_session_id"]: item for item in sessions}
     behavior_by_id = {key: value["behavior"] for key, value in sessions_by_id.items()}
     out.mkdir(parents=True, exist_ok=True)
+    hmm_manifest_path = hmm_checkpoints / "hmm-release-manifest.json"
+    if not hmm_manifest_path.exists() or _sha256(hmm_manifest_path) != hmm_manifest_sha256:
+        raise ValueError("checkpoint_integrity_failure: HMM manifest hash mismatch")
+    hmm_manifest = json.loads(hmm_manifest_path.read_text())
+    expected_hmm = {
+        "schema": "neural-dev-v4-hmm-release-v1",
+        "method_revision": METHOD_REVISION,
+        "primary_k": PRIMARY_HMM_K,
+        "k_selection_performed": False,
+        "cache_release": cache_release,
+        "cache_manifest_sha256": cache_manifest_sha256,
+        "prereg_sha256": prereg_sha256,
+        "environment_sha256": environment_sha256,
+    }
+    if any(hmm_manifest.get(key) != value for key, value in expected_hmm.items()):
+        raise ValueError("checkpoint_integrity_failure: HMM provenance mismatch")
 
     trial_flow: list[dict] = []
     posterior_rows: list[dict] = []
@@ -353,8 +392,8 @@ def fit_mouse(
     seed_rows: list[dict] = []
     block_rows: list[dict] = []
     coefficient_rows: list[dict] = []
+    sensitivity_seed_rows: list[dict] = []
     failures: list[dict] = []
-    fit_cache: dict = {}
     for session in sessions:
         for row in session["behavior"].to_dict("records"):
             trial_flow.append(
@@ -367,68 +406,28 @@ def fit_mouse(
             )
         target_id = session["behavior_session_id"]
         try:
-            kwargs = {"fit_cache": fit_cache}
-            if hmm_seeds is not None:
-                kwargs["seeds"] = hmm_seeds
-            if hmm_max_iter is not None:
-                kwargs["max_iter"] = hmm_max_iter
-            target_hmm = select_target_hmm(
-                behavior_by_id, target_id, **kwargs
+            tuning_ids = sorted(set(sessions_by_id) - {int(target_id)})
+            target_probs, inner_probs = load_target_posteriors(
+                hmm_checkpoints,
+                mouse_id=int(mouse_id),
+                target_session=int(target_id),
+                tuning_sessions=tuning_ids,
             )
-            hmm_selection.extend(target_hmm.selection_rows)
-            hmm_starts.extend(target_hmm.start_rows)
-            order = state_order(target_hmm.final_fit, len(HMM_FEATURE_NAMES))
-            initial = np.asarray(
-                target_hmm.final_fit.params.initial.probs, float
-            )[order]
-            transition = np.asarray(
-                target_hmm.final_fit.params.transitions.transition_matrix, float
-            )[np.ix_(order, order)]
-            emission_weights = np.asarray(
-                target_hmm.final_fit.params.emissions.weights, float
-            )[order]
-            for state, value in enumerate(initial):
-                hmm_parameters.append(
-                    {
-                        "target_session": target_id,
-                        "parameter": "initial_probability",
-                        "state": state,
-                        "destination_state": np.nan,
-                        "class": np.nan,
-                        "feature": None,
-                        "value": float(value),
-                    }
-                )
-            for state in range(target_hmm.selected_k):
-                for destination in range(target_hmm.selected_k):
-                    hmm_parameters.append(
-                        {
-                            "target_session": target_id,
-                            "parameter": "transition_probability",
-                            "state": state,
-                            "destination_state": destination,
-                            "class": np.nan,
-                            "feature": None,
-                            "value": float(transition[state, destination]),
-                        }
-                    )
-                for explicit_class in range(2):
-                    for feature, name in enumerate(HMM_FEATURE_NAMES):
-                        hmm_parameters.append(
-                            {
-                                "target_session": target_id,
-                                "parameter": "emission_weight",
-                                "state": state,
-                                "destination_state": np.nan,
-                                "class": explicit_class + 1,
-                                "feature": name,
-                                "value": float(
-                                    emission_weights[
-                                        state, explicit_class, feature
-                                    ]
-                                ),
-                            }
-                        )
+            if len(target_probs) != len(session["behavior"]):
+                raise ValueError("checkpoint_integrity_failure: target alignment")
+            target_hmm = SimpleNamespace(
+                selected_k=PRIMARY_HMM_K,
+                target_probs=target_probs,
+                inner_probs=inner_probs,
+            )
+            hmm_selection.append(
+                {
+                    "target_session": target_id,
+                    "k": PRIMARY_HMM_K,
+                    "selected": True,
+                    "selection_performed": False,
+                }
+            )
             for trial_index, probabilities in enumerate(target_hmm.target_probs):
                 posterior_rows.append(
                     {
@@ -446,12 +445,16 @@ def fit_mouse(
                     session, target_hmm, sessions_by_id, model=model
                 )
                 selected_hyper[model] = (basis, penalty)
+                for candidate in candidates:
+                    candidate["analysis"] = "primary_k2"
                 tuning_rows.extend(candidates)
             if target_hmm.selected_k > 1:
                 basis, penalty, candidates = _tune_model(
                     session, target_hmm, sessions_by_id, model="M2"
                 )
                 selected_hyper["M2"] = (basis, penalty)
+                for candidate in candidates:
+                    candidate["analysis"] = "primary_k2"
                 tuning_rows.extend(candidates)
             target_seeds, target_blocks, target_coefficients = _evaluate_target(
                 session, target_hmm, selected=selected_hyper
@@ -459,6 +462,61 @@ def fit_mouse(
             seed_rows.extend(target_seeds)
             block_rows.extend(target_blocks)
             coefficient_rows.extend(target_coefficients)
+
+            # Sensitivity failures are isolated from the K=2 primary status.
+            # The K=1 analysis has independent external tuning, no dF/F
+            # replication, and no M2 interaction.
+            try:
+                k1_hmm = SimpleNamespace(
+                    selected_k=1,
+                    target_probs=np.ones((len(session["behavior"]), 1), float),
+                    inner_probs={
+                        tuning_id: np.ones(
+                            (len(sessions_by_id[tuning_id]["behavior"]), 1), float
+                        )
+                        for tuning_id in tuning_ids
+                    },
+                )
+                k1_selected: dict[str, tuple[int | None, float]] = {}
+                for model in ("M0", "M1"):
+                    basis, penalty, candidates = _tune_model(
+                        session, k1_hmm, sessions_by_id, model=model
+                    )
+                    k1_selected[model] = (basis, penalty)
+                    for candidate in candidates:
+                        candidate["analysis"] = "sensitivity_k1_no_state"
+                    tuning_rows.extend(candidates)
+                k1_seeds, k1_blocks, k1_coefficients = _evaluate_target(
+                    session,
+                    k1_hmm,
+                    selected=k1_selected,
+                    include_dff=False,
+                    analysis_label="sensitivity_k1_no_state",
+                )
+                sensitivity_seed_rows.extend(k1_seeds)
+                block_rows.extend(k1_blocks)
+                coefficient_rows.extend(k1_coefficients)
+            except Exception as exc:
+                typed_reason = _typed_reason(exc)
+                failures.append(
+                    {
+                        "behavior_session_id": target_id,
+                        "analysis": "sensitivity_k1_no_state",
+                        "reason": typed_reason,
+                        "detail": str(exc),
+                        "exception_type": type(exc).__name__,
+                    }
+                )
+                sensitivity_seed_rows.append(
+                    {
+                        "ophys_experiment_id": session["experiment_id"],
+                        "behavior_session_id": target_id,
+                        "mouse_id": int(mouse_id),
+                        "analysis": "sensitivity_k1_no_state",
+                        "status": "nonestimable",
+                        "reason": typed_reason,
+                    }
+                )
         except Exception as exc:
             typed_reason = _typed_reason(exc)
             failures.append(
@@ -489,6 +547,41 @@ def fit_mouse(
     _write_table(block_rows, out / "hazard_blocks.parquet")
     _write_table(coefficient_rows, out / "hazard_coefficients.parquet")
     _write_table(failures, out / "typed_failures.parquet")
+    pd.DataFrame(
+        sensitivity_seed_rows,
+        columns=sorted(
+            {
+                "ophys_experiment_id",
+                "behavior_session_id",
+                "mouse_id",
+                "cell_seed",
+                "selected_k",
+                "n_evaluated_trials",
+                "m0_per_trial_loglik",
+                "m1_per_trial_loglik",
+                "delta_ll",
+                "m2_per_trial_loglik",
+                "m2_minus_m1",
+                "m2_status",
+                "dff_m1_per_trial_loglik",
+                "dff_delta_ll",
+                "status",
+                "reason",
+                "analysis",
+            }
+            | {
+                key
+                for row in sensitivity_seed_rows
+                for key in row
+            }
+        ),
+    ).to_parquet(out / "k1_hazard_sensitivity.parquet", index=False)
+    behavior_sensitivity = pd.read_parquet(
+        hmm_checkpoints / "behavior_sensitivity.parquet"
+    )
+    behavior_sensitivity[
+        behavior_sensitivity.mouse_id.astype(int).eq(int(mouse_id))
+    ].to_parquet(out / "behavior_sensitivity.parquet", index=False)
 
     estimable = pd.DataFrame(seed_rows)
     n_estimable_sessions = (
@@ -501,15 +594,20 @@ def fit_mouse(
     )
     result = {
         "schema": MOUSE_SCHEMA,
+        "method_revision": METHOD_REVISION,
+        "primary_k": PRIMARY_HMM_K,
+        "k_selection_performed": False,
         "mouse_id": int(mouse_id),
         "cache_release": cache_release,
         "cache_manifest_sha256": cache_manifest_sha256,
         "prereg_sha256": prereg_sha256,
         "environment_sha256": environment_sha256,
+        "hmm_release": hmm_release,
+        "hmm_manifest_sha256": hmm_manifest_sha256,
         "n_expected_sessions": n_expected_sessions,
         "n_estimable_sessions": n_estimable_sessions,
         "status": "estimable" if n_estimable_sessions else "nonestimable",
-        "diagnostics_complete": len(failures) == 0,
+        "diagnostics_complete": True,
         "failures": failures,
         "typed_reasons": sorted(
             {
@@ -570,6 +668,8 @@ def aggregate(
     cache_manifest_sha256: str,
     prereg_sha256: str,
     environment_sha256: str,
+    hmm_release: str,
+    hmm_manifest_sha256: str,
 ) -> dict:
     from scipy.stats import t
 
@@ -581,11 +681,17 @@ def aggregate(
     )
     if len(expected_mice) != 10:
         raise ValueError("aggregate requires exactly ten immutable DEV mice")
-    manifests, seed_frames = [], []
+    manifests, seed_frames, k1_frames, behavior_frames = [], [], [], []
     for path in sorted(mouse_results.rglob("mouse-manifest.json")):
         manifest = json.loads(path.read_text())
         manifests.append(manifest)
         seed_frames.append(pd.read_parquet(path.parent / "session_seeds.parquet"))
+        k1_frames.append(
+            pd.read_parquet(path.parent / "k1_hazard_sensitivity.parquet")
+        )
+        behavior_frames.append(
+            pd.read_parquet(path.parent / "behavior_sensitivity.parquet")
+        )
     found = sorted(int(item["mouse_id"]) for item in manifests)
     if found != expected_mice:
         raise ValueError(f"mouse shard mismatch expected={expected_mice} found={found}")
@@ -596,11 +702,18 @@ def aggregate(
             "cache_manifest_sha256": cache_manifest_sha256,
             "prereg_sha256": prereg_sha256,
             "environment_sha256": environment_sha256,
+            "hmm_release": hmm_release,
+            "hmm_manifest_sha256": hmm_manifest_sha256,
+            "method_revision": METHOD_REVISION,
+            "primary_k": PRIMARY_HMM_K,
+            "k_selection_performed": False,
         }
         for key, value in expected.items():
             if item.get(key) != value:
                 raise ValueError(f"mouse {item.get('mouse_id')} {key} mismatch")
     seeds = pd.concat(seed_frames, ignore_index=True)
+    k1_seeds = pd.concat(k1_frames, ignore_index=True)
+    behavior_sensitivity = pd.concat(behavior_frames, ignore_index=True)
     valid = seeds[
         seeds.get("status", pd.Series(index=seeds.index, dtype=str)).eq("estimable")
         & seeds.get("delta_ll", pd.Series(index=seeds.index, dtype=float)).notna()
@@ -663,6 +776,80 @@ def aggregate(
             "dff_delta_ll",
         ],
     )
+
+    k1_valid = k1_seeds[
+        k1_seeds.get(
+            "status", pd.Series(index=k1_seeds.index, dtype=str)
+        ).eq("estimable")
+        & k1_seeds.get(
+            "delta_ll", pd.Series(index=k1_seeds.index, dtype=float)
+        ).notna()
+    ].copy()
+    k1_session_rows = []
+    for (mouse, session), group in k1_valid.groupby(
+        ["mouse_id", "behavior_session_id"]
+    ):
+        if set(group.cell_seed.astype(int)) != set(CELL_SEEDS):
+            continue
+        k1_session_rows.append(
+            {
+                "mouse_id": int(mouse),
+                "behavior_session_id": int(session),
+                "n_evaluated_trials": int(group.n_evaluated_trials.iloc[0]),
+                "delta_ll": float(group.delta_ll.mean()),
+            }
+        )
+    k1_sessions = pd.DataFrame(
+        k1_session_rows,
+        columns=[
+            "mouse_id",
+            "behavior_session_id",
+            "n_evaluated_trials",
+            "delta_ll",
+        ],
+    )
+    k1_mouse_rows = []
+    for mouse, group in k1_sessions.groupby("mouse_id"):
+        weights = group.n_evaluated_trials.to_numpy(float)
+        k1_mouse_rows.append(
+            {
+                "mouse_id": int(mouse),
+                "n_sessions": int(len(group)),
+                "n_evaluated_trials": int(weights.sum()),
+                "delta_ll": float(np.average(group.delta_ll, weights=weights)),
+            }
+        )
+    k1_mice = pd.DataFrame(
+        k1_mouse_rows,
+        columns=["mouse_id", "n_sessions", "n_evaluated_trials", "delta_ll"],
+    )
+
+    behavior_mouse = (
+        behavior_sensitivity.groupby("mouse_id", as_index=False)[
+            ["k2_minus_k1", "k3_minus_k2"]
+        ]
+        .mean()
+        .sort_values("mouse_id")
+    )
+
+    def diagnostic_t(values) -> dict:
+        values = np.asarray(values, float)
+        values = values[np.isfinite(values)]
+        if len(values) < 2:
+            return {
+                "n_mice": int(len(values)),
+                "mean": float(values.mean()) if len(values) else None,
+                "t95": [None, None],
+            }
+        value_mean = float(values.mean())
+        se = float(values.std(ddof=1) / np.sqrt(len(values)))
+        critical = float(t.ppf(0.975, len(values) - 1))
+        return {
+            "n_mice": int(len(values)),
+            "mean": value_mean,
+            "standard_error": se,
+            "t95": [value_mean - critical * se, value_mean + critical * se],
+        }
     coverage = len(mice)
     group_status = "estimable" if coverage >= REQUIRED_MICE else "nonestimable_mouse_coverage"
     values = mice.delta_ll.to_numpy(float) if len(mice) else np.empty(0)
@@ -717,9 +904,27 @@ def aggregate(
     out.mkdir(parents=True, exist_ok=True)
     sessions.to_parquet(out / "sessions.parquet", index=False)
     mice.to_parquet(out / "mice.parquet", index=False)
+    k1_sessions.to_parquet(
+        out / "k1_sensitivity_sessions.parquet", index=False
+    )
+    k1_mice.to_parquet(out / "k1_sensitivity_mice.parquet", index=False)
+    behavior_sensitivity.to_parquet(
+        out / "behavior_sensitivity_sessions.parquet", index=False
+    )
+    behavior_mouse.to_parquet(
+        out / "behavior_sensitivity_mice.parquet", index=False
+    )
     pd.DataFrame(lomo).to_parquet(out / "leave_one_mouse_out.parquet", index=False)
     result = {
         "schema": RESULT_SCHEMA,
+        "method_revision": METHOD_REVISION,
+        "behavior_model": {
+            "primary_k": PRIMARY_HMM_K,
+            "k_selection_performed": False,
+            "sensitivity_k": [1, 3],
+            "checkpoint_release": hmm_release,
+            "checkpoint_manifest_sha256": hmm_manifest_sha256,
+        },
         "status": group_status,
         "cache_source": {
             "release": cache_release,
@@ -756,6 +961,22 @@ def aggregate(
                 "m1_minus_m0_mouse_mean": (
                     float(mice.dff_delta_ll.mean()) if len(mice) else None
                 ),
+            },
+        },
+        "sensitivity": {
+            "k1_no_state_events_m1_minus_m0": {
+                "status": (
+                    "estimable"
+                    if len(k1_mice) >= REQUIRED_MICE
+                    else "nonestimable_mouse_coverage"
+                ),
+                "required_mice": REQUIRED_MICE,
+                **diagnostic_t(k1_mice.delta_ll),
+            },
+            "behavior_adequacy": {
+                "k2_minus_k1": diagnostic_t(behavior_mouse.k2_minus_k1),
+                "k3_minus_k2": diagnostic_t(behavior_mouse.k3_minus_k2),
+                "changes_primary_k": False,
             },
         },
         "diagnostics": {
