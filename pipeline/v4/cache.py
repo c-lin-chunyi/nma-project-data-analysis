@@ -260,8 +260,9 @@ def materialize_container(
         manifest.role.eq("active")
         & manifest.ophys_container_id.astype(int).eq(int(container))
     ]
-    if len(selected) != 5:
-        raise ValueError(f"container {container} must contain exactly five active experiments")
+    n_expected = len(selected)
+    if n_expected == 0:
+        raise ValueError(f"container {container} has no active experiments")
     rows, failures = [], []
     for row in selected.itertuples(index=False):
         try:
@@ -284,9 +285,9 @@ def materialize_container(
     report = {
         "schema": CACHE_SCHEMA,
         "container_id": int(container),
-        "n_expected": 5,
+        "n_expected": n_expected,
         "n_complete": len(rows),
-        "complete": not failures and len(rows) == 5,
+        "complete": not failures and len(rows) == n_expected,
         "experiments": rows,
         "failures": failures,
     }

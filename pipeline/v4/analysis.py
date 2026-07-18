@@ -336,8 +336,9 @@ def fit_mouse(
     selected = manifest[
         manifest.role.eq("active") & manifest.mouse_id.astype(int).eq(int(mouse_id))
     ]
-    if len(selected) != 5:
-        raise ValueError(f"mouse {mouse_id} must have exactly five active sessions")
+    n_expected_sessions = len(selected)
+    if n_expected_sessions == 0:
+        raise ValueError(f"mouse {mouse_id} has no active sessions")
     sessions = [_read_session(cache, row) for row in selected.itertuples(index=False)]
     sessions_by_id = {item["behavior_session_id"]: item for item in sessions}
     behavior_by_id = {key: value["behavior"] for key, value in sessions_by_id.items()}
@@ -505,7 +506,7 @@ def fit_mouse(
         "cache_manifest_sha256": cache_manifest_sha256,
         "prereg_sha256": prereg_sha256,
         "environment_sha256": environment_sha256,
-        "n_expected_sessions": 5,
+        "n_expected_sessions": n_expected_sessions,
         "n_estimable_sessions": n_estimable_sessions,
         "status": "estimable" if n_estimable_sessions else "nonestimable",
         "diagnostics_complete": len(failures) == 0,

@@ -141,7 +141,7 @@ jobs:
           rows=[]
           for mouse, group in table[table.role.eq('active')].groupby('mouse_id'):
               containers=group.ophys_container_id.astype(int).unique()
-              assert len(group)==5 and len(containers)==1
+              assert len(group)>0 and len(containers)==1
               rows.append({'mouse_id':int(mouse),'container_id':int(containers[0])})
           assert len(rows)==10
           Path('run/mice.json').write_text(json.dumps(rows))

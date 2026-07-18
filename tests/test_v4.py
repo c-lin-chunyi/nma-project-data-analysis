@@ -8,15 +8,21 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import h5py
 import numpy as np
 import pandas as pd
 import yaml
 
-from pipeline.v4.analysis import aggregate
+from pipeline.v4.analysis import aggregate, fit_mouse
 from pipeline.v4.behavior import compile_behavior
-from pipeline.v4.cache import materialize_experiment, sha256_file, validate_source_manifest
+from pipeline.v4.cache import (
+    materialize_container,
+    materialize_experiment,
+    sha256_file,
+    validate_source_manifest,
+)
 from pipeline.v4.constants import (
     CACHE_SCHEMA,
     CELL_SEEDS,
@@ -40,6 +46,26 @@ from pipeline.v4.hmm import one_se_smallest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ACTIVE_COUNTS = (5, 3, 4, 4, 4, 6, 5, 9, 6, 4)
+
+
+def _uneven_source_manifest() -> pd.DataFrame:
+    rows = []
+    experiment_id = 10_000
+    for mouse, active_count in enumerate(ACTIVE_COUNTS):
+        for role, count in (("active", active_count), ("passive", 2)):
+            for _ in range(count):
+                rows.append(
+                    {
+                        "ophys_experiment_id": experiment_id,
+                        "behavior_session_id": experiment_id + 100_000,
+                        "ophys_container_id": 2_000 + mouse,
+                        "mouse_id": 3_000 + mouse,
+                        "role": role,
+                    }
+                )
+                experiment_id += 1
+    return pd.DataFrame(rows)
 
 
 def _empty_trace(value_name: str) -> pd.DataFrame:
@@ -169,20 +195,17 @@ class CacheTests(unittest.TestCase):
                 self.assertTrue(np.all(np.diff(h5["frame_offsets"][:]) > 0))
 
     def test_manifest_active_passive_boundary_and_checksum_corruption(self):
-        rows = []
-        for mouse in range(10):
-            for session in range(7):
-                rows.append(
-                    {
-                        "ophys_experiment_id": mouse * 7 + session,
-                        "behavior_session_id": mouse * 7 + session,
-                        "ophys_container_id": mouse,
-                        "mouse_id": mouse,
-                        "role": "active" if session < 5 else "passive",
-                    }
-                )
-        manifest = pd.DataFrame(rows)
+        manifest = _uneven_source_manifest()
         validate_source_manifest(manifest)
+        self.assertEqual(
+            sorted(
+                manifest[manifest.role.eq("active")]
+                .groupby("mouse_id")
+                .size()
+                .tolist()
+            ),
+            sorted(ACTIVE_COUNTS),
+        )
         with self.assertRaises(ValueError):
             validate_source_manifest(manifest[manifest.role.eq("active")])
         with tempfile.TemporaryDirectory() as directory:
@@ -191,6 +214,43 @@ class CacheTests(unittest.TestCase):
             first = sha256_file(path)
             path.write_bytes(b"corrupt")
             self.assertNotEqual(first, sha256_file(path))
+
+    def test_materialize_container_uses_manifest_active_count(self):
+        manifest = _uneven_source_manifest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.csv"
+            manifest.to_csv(manifest_path, index=False)
+
+            def fake_materialize(_source, _out, row, **_kwargs):
+                return {"ophys_experiment_id": int(row.ophys_experiment_id)}
+
+            with patch(
+                "pipeline.v4.cache.materialize_experiment",
+                side_effect=fake_materialize,
+            ):
+                for container, expected in ((2_001, 3), (2_007, 9)):
+                    report = materialize_container(
+                        root / "source",
+                        manifest_path,
+                        root / f"cache-{container}",
+                        container,
+                        neural_release="neural-dev-data-1",
+                        data_manifest_sha256="a" * 64,
+                    )
+                    self.assertEqual(report["n_expected"], expected)
+                    self.assertEqual(report["n_complete"], expected)
+                    self.assertTrue(report["complete"])
+
+                with self.assertRaisesRegex(ValueError, "no active experiments"):
+                    materialize_container(
+                        root / "source",
+                        manifest_path,
+                        root / "cache-missing",
+                        999_999,
+                        neural_release="neural-dev-data-1",
+                        data_manifest_sha256="a" * 64,
+                    )
 
 
 def _hazard_behavior(first_lick: float) -> pd.DataFrame:
@@ -303,6 +363,49 @@ class HazardTests(unittest.TestCase):
 
 
 class AggregateAndWorkflowTests(unittest.TestCase):
+    def test_fit_mouse_uses_manifest_session_count(self):
+        manifest = _uneven_source_manifest()
+        mouse_id = 3_001
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.csv"
+            manifest.to_csv(manifest_path, index=False)
+
+            def fake_read_session(_cache, row):
+                return {
+                    "experiment_id": int(row.ophys_experiment_id),
+                    "behavior_session_id": int(row.behavior_session_id),
+                    "mouse_id": int(row.mouse_id),
+                    "behavior": pd.DataFrame([{"trial_id_v4": 0}]),
+                    "cells": np.array([], dtype=np.int64),
+                    "neural": {},
+                }
+
+            with (
+                patch(
+                    "pipeline.v4.analysis._read_session",
+                    side_effect=fake_read_session,
+                ),
+                patch(
+                    "pipeline.v4.analysis.select_target_hmm",
+                    side_effect=ValueError("no_hazard_event"),
+                ),
+            ):
+                result = fit_mouse(
+                    root / "cache",
+                    manifest_path,
+                    root / "mouse",
+                    mouse_id=mouse_id,
+                    cache_release="cache",
+                    cache_manifest_sha256="c",
+                    prereg_sha256="p",
+                    environment_sha256="e",
+                )
+
+            self.assertEqual(result["n_expected_sessions"], 3)
+            self.assertEqual(len(result["failures"]), 3)
+            self.assertFalse(result["confirm_ready"])
+
     def test_aggregate_eight_mouse_coverage_and_closed_confirm(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -423,6 +526,8 @@ class AggregateAndWorkflowTests(unittest.TestCase):
         self.assertIn("acceptance", v4_action)
         self.assertIn("dev", v4_action)
         self.assertIn("already exists publicly; r1 cannot be overwritten", v4_action)
+        self.assertIn("key=lambda part: part['name']", cache_action)
+        self.assertNotIn("len(group)==5", v4_action)
         self.assertNotIn(".nwb", cache_action.lower() + v4_action.lower())
         self.assertNotIn("allensdk", cache_action.lower() + v4_action.lower())
         prereg = (ROOT / "docs/prereg_v4.md").read_text()

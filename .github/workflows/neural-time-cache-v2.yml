@@ -135,8 +135,12 @@ jobs:
           from pathlib import Path
           package=json.loads(Path('run/input/data-package-manifest.json').read_text())
           parts=sorted(
-              part for part in package['parts']
-              if int(part['container_id'])==int(os.environ['CONTAINER']))
+              (
+                  part for part in package['parts']
+                  if int(part['container_id'])==int(os.environ['CONTAINER'])
+              ),
+              key=lambda part: part['name'],
+          )
           assert parts
           Path('run/parts.txt').write_text('\n'.join(p['name'] for p in parts)+'\n')
           Path('run/parts.sha256').write_text(
