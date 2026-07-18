@@ -215,11 +215,30 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p run/download run/cache assets
+          gh release view "$CACHE_TAG" --json assets > run/draft-assets.json
+          download_draft_asset() {
+            local name="$1"
+            local endpoint
+            endpoint="$(python - "$name" <<'PY'
+          import json, sys
+          from pathlib import Path
+          assets=json.loads(Path('run/draft-assets.json').read_text())['assets']
+          matches=[asset for asset in assets if asset['name']==sys.argv[1]]
+          if len(matches)!=1:
+              raise SystemExit(
+                  f"expected one draft asset named {sys.argv[1]!r}, found {len(matches)}")
+          print(matches[0]['apiUrl'].removeprefix('https://api.github.com'))
+          PY
+          )"
+            gh api -H 'Accept: application/octet-stream' "$endpoint" \
+              > "run/download/$name"
+          }
           containers='${{ needs.prepare.outputs.containers }}'
           python -c 'import json,sys; print("\\n".join(map(str,json.loads(sys.argv[1]))))' "$containers" > run/containers.txt
           while IFS= read -r container; do
             archive="time-cache-container-${container}.tar.gz"
-            gh release download "$CACHE_TAG" -p "$archive" -p "${archive}.sha256" -D run/download
+            download_draft_asset "$archive"
+            download_draft_asset "${archive}.sha256"
             (cd run/download && sha256sum --check "${archive}.sha256")
             tar -xzf "run/download/$archive" -C run/cache
           done < run/containers.txt

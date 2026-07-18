@@ -527,6 +527,17 @@ class AggregateAndWorkflowTests(unittest.TestCase):
         self.assertIn("dev", v4_action)
         self.assertIn("already exists publicly; r1 cannot be overwritten", v4_action)
         self.assertIn("key=lambda part: part['name']", cache_action)
+        self.assertIn("download_draft_asset", cache_action)
+        self.assertIn("Accept: application/octet-stream", cache_action)
+        self.assertIn("Accept: application/octet-stream", v4_action)
+        self.assertNotIn(
+            'gh release download "$CACHE_TAG" -p "$archive"',
+            cache_action,
+        )
+        self.assertNotIn(
+            'gh release download "$result_tag" -p draft-provenance.json',
+            v4_action,
+        )
         self.assertNotIn("len(group)==5", v4_action)
         self.assertNotIn(".nwb", cache_action.lower() + v4_action.lower())
         self.assertNotIn("allensdk", cache_action.lower() + v4_action.lower())

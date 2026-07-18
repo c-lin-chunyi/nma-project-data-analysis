@@ -172,7 +172,23 @@ jobs:
               echo "::error::$result_tag already exists publicly; r1 cannot be overwritten"; exit 1;
             }
             mkdir -p run/existing
-            gh release download "$result_tag" -p draft-provenance.json -D run/existing
+            gh release view "$result_tag" --json assets > run/existing-assets.json
+            endpoint=$(python - <<'PY'
+          import json
+          from pathlib import Path
+          assets=json.loads(Path('run/existing-assets.json').read_text())['assets']
+          matches=[
+              asset for asset in assets
+              if asset['name']=='draft-provenance.json'
+          ]
+          if len(matches)!=1:
+              raise SystemExit(
+                  f"expected one draft-provenance.json asset, found {len(matches)}")
+          print(matches[0]['apiUrl'].removeprefix('https://api.github.com'))
+          PY
+          )
+            gh api -H 'Accept: application/octet-stream' "$endpoint" \
+              > run/existing/draft-provenance.json
             cmp run/input/draft-provenance.json run/existing/draft-provenance.json
           else
             gh release create "$result_tag" --target "$GITHUB_SHA" \
