@@ -234,7 +234,11 @@ jobs:
               > "run/download/$name"
           }
           containers='${{ needs.prepare.outputs.containers }}'
-          python -c 'import json,sys; print("\\n".join(map(str,json.loads(sys.argv[1]))))' "$containers" > run/containers.txt
+          python - "$containers" > run/containers.txt <<'PY'
+          import json, sys
+          for container in json.loads(sys.argv[1]):
+              print(container)
+          PY
           while IFS= read -r container; do
             archive="time-cache-container-${container}.tar.gz"
             download_draft_asset "$archive"

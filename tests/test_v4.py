@@ -530,6 +530,11 @@ class AggregateAndWorkflowTests(unittest.TestCase):
         self.assertIn("download_draft_asset", cache_action)
         self.assertIn("Accept: application/octet-stream", cache_action)
         self.assertIn("Accept: application/octet-stream", v4_action)
+        self.assertIn(
+            "for container in json.loads(sys.argv[1]):",
+            cache_action,
+        )
+        self.assertNotIn(r'print("\\n".join', cache_action)
         self.assertNotIn(
             'gh release download "$CACHE_TAG" -p "$archive"',
             cache_action,
