@@ -30,3 +30,15 @@ compressed), not the roughly 16.8 GB raw neural package.
 Both notebooks are **DEV-only educational explorers**. They never request
 CONFIRM data, and exploratory decoder settings do not replace the authoritative
 release analyses.
+
+## Model workflow
+
+The v3.3 analysis is centered on regularized logistic models: the Q1 outcome
+decoder, the calibrated state-probability model, and the calibrated M0/M1
+comparison for Q2. The diagram emphasizes model fitting, temporal isolation,
+calibration, and evaluation rather than tree-based decision logic.
+
+![v3.3 logistic-model workflow](docs/v33-model-workflow.svg)
+
+The editable diagram source is
+[`docs/v33-model-workflow.d2`](docs/v33-model-workflow.d2).

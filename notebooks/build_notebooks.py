@@ -68,6 +68,7 @@ DECODER_SOURCE = embedded_source(
     ROOT / "nma_play" / "decoder.py",
     strip=("from .release import FeatureMatrix\n",),
 )
+MODEL_WORKFLOW_SVG = embedded_source(ROOT / "docs" / "v33-model-workflow.svg")
 
 DEPENDENCY_SETUP = r"""
 import subprocess
@@ -1084,7 +1085,14 @@ neural_notebook = notebook([
     code(NEURAL_LOAD),
     markdown("## 4. Cohort browser"),
     code(NEURAL_COHORT),
-    markdown("## 5. Static single-experiment analysis"),
+    markdown(
+        "## 5. Logistic-model workflow\n\n"
+        "The registered analysis uses regularized logistic models with "
+        "temporally isolated evaluation and training-only calibration. "
+        "The diagram emphasizes model inputs, fitting, and metrics."
+    ),
+    markdown(MODEL_WORKFLOW_SVG),
+    markdown("## 6. Static single-experiment analysis"),
     code(NEURAL_STATIC_ANALYSIS),
 ])
 
