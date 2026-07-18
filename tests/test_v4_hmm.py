@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -24,6 +25,7 @@ from pipeline.v4.hmm_checkpoint import (
     _write_failure_checkpoint,
     _write_checkpoint,
     fit_specs,
+    plan_chunks,
 )
 
 
@@ -175,6 +177,47 @@ class HMMWrapperTests(unittest.TestCase):
                 for spec in five_session_specs
             ),
             10,
+        )
+
+    def test_hmm_plan_is_json_serializable_with_native_matrix_scalars(self):
+        rows = []
+        for mouse_index in range(10):
+            for session_index in range(5):
+                rows.append(
+                    {
+                        "ophys_experiment_id": mouse_index * 5 + session_index,
+                        "behavior_session_id": mouse_index * 5 + session_index,
+                        "ophys_container_id": 10_000 + mouse_index,
+                        "mouse_id": 20_000 + mouse_index,
+                        "role": "active",
+                    }
+                )
+            for passive_index in range(2):
+                rows.append(
+                    {
+                        "ophys_experiment_id": 1_000
+                        + mouse_index * 2
+                        + passive_index,
+                        "behavior_session_id": 1_000
+                        + mouse_index * 2
+                        + passive_index,
+                        "ophys_container_id": 10_000 + mouse_index,
+                        "mouse_id": 20_000 + mouse_index,
+                        "role": "passive",
+                    }
+                )
+        with TemporaryDirectory() as temporary:
+            manifest = Path(temporary) / "manifest.csv"
+            pd.DataFrame(rows).to_csv(manifest, index=False)
+            plan = plan_chunks(manifest, max_fit_keys=5)
+        restored = json.loads(json.dumps(plan))
+        self.assertEqual(len(restored["chunks"]), 50)
+        self.assertTrue(
+            all(
+                type(row[key]) is int
+                for row in restored["chunks"]
+                for key in ("mouse_id", "container_id", "chunk_id")
+            )
         )
 
     def test_k1_and_transition_preserving_internal_missing(self):

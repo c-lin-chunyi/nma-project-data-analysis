@@ -99,7 +99,7 @@ def plan_chunks(manifest_path: Path, *, max_fit_keys: int = 5) -> dict:
             chunks.append(
                 {
                     "mouse_id": int(mouse_id),
-                    "container_id": containers[0],
+                    "container_id": int(containers[0]),
                     "chunk_id": int(chunk_index),
                     "fit_ids": ",".join(item.fit_id for item in selected),
                 }
