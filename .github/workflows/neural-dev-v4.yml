@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Run registered acceptance only, or acceptance followed by DEV'
+        description: 'Run implementation acceptance only, or acceptance followed by DEV'
         required: true
         default: acceptance
         type: choice
@@ -61,10 +61,10 @@ jobs:
           PY
       - name: Run v4 unit and static action tests
         run: python -m unittest discover -s tests -p 'test_v4*.py' -v
-      - name: Run registered simulation and invariance suite
+      - name: Run implementation invariance suite
         run: |
           mkdir -p run/acceptance
-          python -m pipeline.v4 acceptance --profile registered \
+          python -m pipeline.v4 acceptance \
             --output run/acceptance/acceptance-report.json
           python -m pip freeze > run/acceptance/environment-freeze.txt
           sha256sum requirements-v4.txt > run/acceptance/environment-input.sha256

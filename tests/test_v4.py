@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from pipeline.v4.acceptance import run_acceptance
 from pipeline.v4.analysis import aggregate, fit_mouse
 from pipeline.v4.behavior import compile_behavior
 from pipeline.v4.cache import (
@@ -363,6 +364,15 @@ class HazardTests(unittest.TestCase):
 
 
 class AggregateAndWorkflowTests(unittest.TestCase):
+    def test_acceptance_has_no_recovery_or_selection_simulation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "acceptance.json"
+            result = run_acceptance(output)
+            self.assertTrue(result["passed"])
+            self.assertFalse(result["simulation_recovery_performed"])
+            self.assertFalse(result["k_selection_simulation_performed"])
+            self.assertEqual(result, json.loads(output.read_text()))
+
     def test_fit_mouse_uses_manifest_session_count(self):
         manifest = _uneven_source_manifest()
         mouse_id = 3_001
@@ -525,6 +535,9 @@ class AggregateAndWorkflowTests(unittest.TestCase):
         self.assertIn("requirements-v4.txt", v4_action)
         self.assertIn("acceptance", v4_action)
         self.assertIn("dev", v4_action)
+        self.assertIn("Run implementation invariance suite", v4_action)
+        self.assertNotIn("--profile registered", v4_action)
+        self.assertNotIn("registered simulation", v4_action.lower())
         self.assertIn("already exists publicly; r1 cannot be overwritten", v4_action)
         self.assertIn("key=lambda part: part['name']", cache_action)
         self.assertIn("download_draft_asset", cache_action)
@@ -555,6 +568,10 @@ class AggregateAndWorkflowTests(unittest.TestCase):
             prereg,
         )
         self.assertIn("have no role\nin the v4 primary estimand", prereg)
+        self.assertIn(
+            "simulations are not acceptance gates",
+            prereg,
+        )
         requirements = (ROOT / "requirements-v4.txt").read_text().lower()
         requirement_lines = [
             line for line in requirements.splitlines()

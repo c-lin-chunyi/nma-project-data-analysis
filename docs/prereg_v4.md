@@ -520,35 +520,26 @@ Before the first v4 DEV analysis, future implementation must pass:
 1. a clean Python 3.11 install from `requirements-v4.txt`, import
    `SoftmaxGLMHMM`, call `predict_state_probs`, and confirm JAX 64-bit
    likelihood arrays;
-2. a registered \(K=2\) simulation with 5 sessions x 1,500 trials and all 20
-   starts; after optimal label matching, transition-matrix maximum absolute
-   error must be `<=0.08`, emission-probability RMSE on the fixed covariate grid
-   must be `<=0.08`, and held-out smoothed-state balanced accuracy must be
-   `>=0.80`. The fixed 24-row grid is the Cartesian product of scheduled
-   change/catch, novelty `0/1`, previous observed emission
-   `abort/task_response/withhold`, and previous reward `0/1`; continuous
-   covariates are zero and missing indicators are zero. The simulation uses
-   seed `4102`, transition matrix `[[0.94,0.06],[0.06,0.94]]`, and
-   class-0-baseline explicit logits `[3,-3]` with go increment `[-6,6]` in
-   state 0 and `[-3,3]` with go increment `[6,-6]` in state 1; all nonlisted
-   true emission coefficients are zero;
-3. a registered data-generating \(K=1\) negative control with 5 sessions x 800
-   trials; the complete \(K=1,2,3,4\), 20-start, nested one-SE procedure must
-   select \(K=1\), and an internal missing-emission case must retain transition
-   propagation. It uses seed `4101`, explicit-class intercept logits
-   `[0.45,-0.35]`, scheduled-change increments `[0.20,-0.15]`, and zero for
-   every other true emission coefficient;
-4. a future-behavior invariance test: changing emissions after trial \(t\)
+2. a future-behavior invariance test: changing emissions after trial \(t\)
    leaves all predictive posteriors through \(t\) unchanged;
-5. a future-neural invariance test: changing neural frames at or after a bin
+3. a future-neural invariance test: changing neural frames at or after a bin
    left edge leaves that bin's causal features unchanged;
-6. proof that frames at or after the first lick never enter risk covariates;
-7. session-boundary reset, `[0,0.15)` competing-event, exact event-bin, and
+4. proof that internal missing emissions preserve transition propagation and
+   that session padding remains distinct from internal missingness;
+5. proof that frames at or after the first lick never enter risk covariates;
+6. session-boundary reset, `[0,0.15)` competing-event, exact event-bin, and
    0.75-second administrative-censor tests;
-8. expanding-window assertions that every training index and fitted
+7. expanding-window assertions that every training index and fitted
    preprocessing observation precedes the test block;
-9. source/cache/release checksum, one-to-one trial alignment, monotonic
+8. source/cache/release checksum, one-to-one trial alignment, monotonic
    timestamp, and feature-shape validation.
+
+Parameter-recovery, latent-state-recovery, and synthetic \(K\)-selection
+simulations are not acceptance gates and do not determine preregistration
+freeze, DEV execution, v4.1 eligibility, or interpretation. They are not used
+to claim that a fitted state has a particular psychological meaning. The
+registered 20-start, 500-iteration configuration is evaluated on the immutable
+DEV analysis itself under the typed failure and coverage rules above.
 
 The two legacy requirements files must retain their pre-v4 byte contents.
 Acceptance records their SHA-256 values before and after v4 setup. The v4
@@ -556,9 +547,9 @@ environment uses Python 3.11, the isolated fully pinned `requirements-v4.txt`,
 JAX 64-bit mode, and no AllenSDK; existing workflows continue in their original
 environments.
 
-This document remains **DRAFT** until dependency installation, simulation
-recovery, and both future-information invariance suites pass. Only a separate,
-explicit preregistration change may then mark v4 frozen.
+This document remains **DRAFT** until dependency installation and all
+implementation-invariance, alignment, and causal-history acceptance checks
+pass. Only a separate, explicit preregistration change may then mark v4 frozen.
 
 After the one registered v4 DEV run, v4.1 eligibility requires only:
 

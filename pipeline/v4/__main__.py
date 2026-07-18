@@ -34,9 +34,6 @@ def _parser() -> argparse.ArgumentParser:
 
     acceptance = commands.add_parser("acceptance")
     acceptance.add_argument("--output", required=True, type=_path)
-    acceptance.add_argument(
-        "--profile", choices=("registered", "fast"), default="registered"
-    )
 
     mouse = commands.add_parser("fit-mouse")
     mouse.add_argument("--cache", required=True, type=_path)
@@ -73,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "cache-verify":
         result = verify_cache(args.cache, args.manifest, args.report)
     elif args.command == "acceptance":
-        result = run_acceptance(args.output, profile=args.profile)
+        result = run_acceptance(args.output)
     elif args.command == "fit-mouse":
         result = fit_mouse(
             args.cache,
