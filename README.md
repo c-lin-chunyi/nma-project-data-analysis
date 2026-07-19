@@ -56,8 +56,16 @@ alter the v1–v3 analysis environments. Run the Actions in this order:
    `neural-dev-v4-hmm-<cache-source>-r2`.
 3. Run **neural DEV v4 predictive-state hazard analysis** in `dev` mode with
    both exact public tags. It consumes, but never refits, the HMM checkpoints
-   and publishes `neural-dev-v4-<cache-source>-r2`. The `acceptance` mode remains
-   an implementation-only dry run and makes no analysis Release.
+   and dispatches one resumable shard per active target session (50 targets,
+   at most ten concurrent jobs). It publishes
+   `neural-dev-v4-<cache-source>-r3`. The `acceptance` mode remains an
+   implementation-only dry run, performs no recovery simulation, and makes no
+   analysis Release.
+
+The r2 hazard draft is retained as an implementation/method failure and is not
+overwritten. r3 separately records the immutable r2 HMM prereg hash and the r3
+hazard-amendment hash. Interrupted target jobs resume only checksum- and
+provenance-matched candidate groups.
 
 A statistically nonestimable DEV result is still a valid v4 release. Pipeline
 or integrity failures prevent publication. Every v4 result keeps

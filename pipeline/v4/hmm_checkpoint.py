@@ -22,7 +22,7 @@ from .constants import (
     HMM_RELEASE_SCHEMA,
     HMM_SEEDS,
     HMM_TOL,
-    METHOD_REVISION,
+    HMM_METHOD_REVISION,
     PRIMARY_HMM_K,
 )
 from .hmm import (
@@ -106,7 +106,7 @@ def plan_chunks(manifest_path: Path, *, max_fit_keys: int = 5) -> dict:
             )
     return {
         "schema": "neural-dev-v4-hmm-plan-v1",
-        "method_revision": METHOD_REVISION,
+        "method_revision": HMM_METHOD_REVISION,
         "max_fit_keys_per_chunk": int(max_fit_keys),
         "chunks": chunks,
     }
@@ -210,7 +210,7 @@ def _write_checkpoint(
         files = ("parameters.npz", "starts.parquet", "predictive.parquet")
         result = {
             "schema": HMM_CHECKPOINT_SCHEMA,
-            "method_revision": METHOD_REVISION,
+            "method_revision": HMM_METHOD_REVISION,
             "fit_id": spec.fit_id,
             "mouse_id": spec.mouse_id,
             "k": spec.k,
@@ -275,7 +275,7 @@ def _write_failure_checkpoint(
             files["starts.parquet"] = _sha256(temporary / "starts.parquet")
         result = {
             "schema": HMM_CHECKPOINT_SCHEMA,
-            "method_revision": METHOD_REVISION,
+            "method_revision": HMM_METHOD_REVISION,
             "fit_id": spec.fit_id,
             "mouse_id": spec.mouse_id,
             "k": spec.k,
@@ -434,7 +434,7 @@ def fit_chunk(
         completed.append(fit_id)
     result = {
         "schema": "neural-dev-v4-hmm-chunk-v1",
-        "method_revision": METHOD_REVISION,
+        "method_revision": HMM_METHOD_REVISION,
         "mouse_id": int(mouse_id),
         "requested": list(requested),
         "completed": completed,
@@ -553,7 +553,7 @@ def verify_release(
     wide.to_parquet(out / "behavior_sensitivity.parquet", index=False)
     result = {
         "schema": HMM_RELEASE_SCHEMA,
-        "method_revision": METHOD_REVISION,
+        "method_revision": HMM_METHOD_REVISION,
         "primary_k": PRIMARY_HMM_K,
         "k_selection_performed": False,
         "sensitivity_k": [1, 3],

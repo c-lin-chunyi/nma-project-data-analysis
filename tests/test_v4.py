@@ -16,7 +16,7 @@ import pandas as pd
 import yaml
 
 from pipeline.v4.acceptance import run_acceptance
-from pipeline.v4.analysis import aggregate, fit_mouse
+from pipeline.v4.analysis import aggregate, aggregate_targets, fit_mouse
 from pipeline.v4.behavior import compile_behavior
 from pipeline.v4.cache import (
     materialize_container,
@@ -31,19 +31,31 @@ from pipeline.v4.constants import (
     EMISSION_MISSING,
     EMISSION_TASK_RESPONSE,
     EMISSION_WITHHOLD,
+    RIDGE_GRID,
 )
 from pipeline.v4.hazard import (
+    _cloglog_value_derivative,
+    _numpy_cloglog,
     NeuralTrial,
     apply_transform,
     build_risk_rows,
     causal_history,
     event_bin,
+    fit_hazard,
     fit_transform,
     one_se_hazard,
     raw_blocks,
     risk_bins,
+    ridge_mask,
 )
 from pipeline.v4.hmm import one_se_smallest
+from pipeline.v4.target import (
+    _checkpoint_group,
+    _preflight_one,
+    assemble_seed_frame,
+    hazard_plan,
+    require_eligible_sessions,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -362,8 +374,327 @@ class HazardTests(unittest.TestCase):
             one_se_smallest({1: 0.0, 2: 0.01}, {1: 0.0, 2: 0.02}), 1
         )
 
+    def test_incomplete_candidate_does_not_invalidate_complete_candidate(self):
+        rows = []
+        for tuning in (1, 2):
+            for penalty in (0.1, 1.0):
+                for seed in CELL_SEEDS:
+                    failed = penalty == 0.1 and tuning == 2 and seed == 3
+                    rows.append(
+                        {
+                            "tuning_session": tuning,
+                            "basis_count": 1,
+                            "penalty": penalty,
+                            "cell_seed": seed,
+                            "per_trial_loglik": np.nan if failed else 1.0,
+                            "status": "nonestimable" if failed else "estimable",
+                        }
+                    )
+        basis, penalty = one_se_hazard(
+            pd.DataFrame(rows), model="M1", eligible_sessions=(1, 2)
+        )
+        self.assertEqual((basis, penalty), (1, 1.0))
+
+    def test_stable_cloglog_extreme_rows_have_no_numpy_warning(self):
+        eta = np.array([-1e3, -36.0, 0.0, 36.0, 1e3])
+        with np.errstate(all="raise"):
+            event = _numpy_cloglog(eta, np.ones(len(eta), int))
+            survival = _numpy_cloglog(
+                np.array([-1e3, 0.0, 36.0, 650.0]),
+                np.zeros(4, int),
+            )
+        self.assertTrue(np.all(np.isfinite(event)))
+        self.assertTrue(np.all(np.isfinite(survival)))
+        import jax.numpy as jnp
+
+        value, gradient = _cloglog_value_derivative(
+            jnp.asarray(eta), jnp.ones(len(eta), dtype=jnp.int32)
+        )
+        self.assertTrue(np.all(np.isfinite(np.asarray(value))))
+        self.assertTrue(np.all(np.isfinite(np.asarray(gradient))))
+
+    def test_cloglog_analytic_gradient_matches_finite_difference(self):
+        import jax.numpy as jnp
+
+        eta = np.array([-5.0, -1.0, 0.0, 1.5])
+        step = 1e-6
+        for event in (0, 1):
+            events = np.full(len(eta), event, int)
+            _, gradient = _cloglog_value_derivative(
+                jnp.asarray(eta), jnp.asarray(events)
+            )
+            finite = (
+                _numpy_cloglog(eta + step, events)
+                - _numpy_cloglog(eta - step, events)
+            ) / (2 * step)
+            np.testing.assert_allclose(
+                np.asarray(gradient), finite, rtol=2e-7, atol=2e-9
+            )
+
+    def test_baseline_is_ridged_and_separation_fits_all_penalties(self):
+        self.assertTrue(np.array_equal(ridge_mask(12), np.ones(12)))
+        rows = []
+        for trial in range(80):
+            for bin_index in (0, 1):
+                rows.append(
+                    {
+                        "trial_id": trial,
+                        "raw_trial_index": trial,
+                        "bin_index": bin_index,
+                        "offset": np.log(0.05),
+                        "event": int(bin_index == 1),
+                        "image_transition": "a->b",
+                        "previous_outcome": "withhold",
+                        "state": np.array([0.5]),
+                        "neural": np.empty(0),
+                        "basis_energy": np.array([0.0]),
+                        **{
+                            name: 0.0
+                            for name in (
+                                "flashes_before_change",
+                                "time_since_previous_change",
+                                "time_since_previous_lick",
+                                "time_since_previous_reward",
+                                "session_position",
+                                "preceding_omission",
+                                "pre_change_pupil",
+                                "pre_change_running",
+                            )
+                        },
+                    }
+                )
+        frame = pd.DataFrame(rows)
+        with np.errstate(all="raise"):
+            fits = [
+                fit_hazard(frame, model="M0", penalty=penalty)
+                for penalty in RIDGE_GRID
+            ]
+        self.assertTrue(all(np.all(np.isfinite(fit.beta)) for fit in fits))
+        self.assertTrue(all(fit.protection_count == 0 for fit in fits))
+
 
 class AggregateAndWorkflowTests(unittest.TestCase):
+    def test_target_aggregate_requires_exact_hash_matched_fifty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_rows = []
+            for mouse in range(10):
+                for session_index in range(5):
+                    target = mouse * 10 + session_index
+                    manifest_rows.append(
+                        {
+                            "ophys_experiment_id": target + 1000,
+                            "behavior_session_id": target,
+                            "ophys_container_id": mouse,
+                            "mouse_id": mouse,
+                            "role": "active",
+                        }
+                    )
+                    shard = root / "targets" / str(target)
+                    shard.mkdir(parents=True)
+                    estimable = mouse < 8
+                    seeds = pd.DataFrame(
+                        [
+                            {
+                                "mouse_id": mouse,
+                                "behavior_session_id": target,
+                                "cell_seed": seed,
+                                "status": (
+                                    "estimable" if estimable else "nonestimable"
+                                ),
+                                "n_evaluated_trials": 20 if estimable else 0,
+                                "delta_ll": 0.01 if estimable else np.nan,
+                                "m2_minus_m1": (
+                                    0.0 if estimable else np.nan
+                                ),
+                                "dff_delta_ll": (
+                                    0.0 if estimable else np.nan
+                                ),
+                            }
+                            for seed in CELL_SEEDS
+                        ]
+                    )
+                    seeds.to_parquet(shard / "session_seeds.parquet", index=False)
+                    seeds.to_parquet(
+                        shard / "k1_hazard_sensitivity.parquet", index=False
+                    )
+                    pd.DataFrame(
+                        [
+                            {
+                                "mouse_id": mouse,
+                                "target_session": target,
+                                "k2_minus_k1": 0.1,
+                                "k3_minus_k2": 0.1,
+                            }
+                        ]
+                    ).to_parquet(
+                        shard / "behavior_sensitivity.parquet", index=False
+                    )
+                    pd.DataFrame(
+                        columns=["analysis", "reason", "detail", "exception_type"]
+                    ).to_parquet(shard / "typed_failures.parquet", index=False)
+                    files = {
+                        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in shard.glob("*.parquet")
+                    }
+                    (shard / "target-manifest.json").write_text(
+                        json.dumps(
+                            {
+                                "schema": "neural-dev-v4-target-v1",
+                                "method_revision": "r3",
+                                "target_session": target,
+                                "mouse_id": mouse,
+                                "cache_release": "cache",
+                                "cache_manifest_sha256": "c",
+                                "hmm_release": "hmm",
+                                "hmm_manifest_sha256": "h",
+                                "hmm_prereg_sha256": "hp",
+                                "hazard_prereg_sha256": "vp",
+                                "environment_sha256": "e",
+                                "code_commit": "code",
+                                "status": "complete",
+                                "diagnostics_complete": True,
+                                "typed_reasons": [],
+                                "files": files,
+                                "numeric_sesoi": None,
+                                "confirm_ready": False,
+                                "confirm_data_accessed": False,
+                            }
+                        )
+                        + "\n"
+                    )
+            source = root / "manifest.csv"
+            pd.DataFrame(manifest_rows).to_csv(source, index=False)
+            result = aggregate_targets(
+                root / "targets",
+                source,
+                root / "out",
+                cache_release="cache",
+                cache_manifest_sha256="c",
+                hmm_prereg_sha256="hp",
+                hazard_prereg_sha256="vp",
+                environment_sha256="e",
+                code_commit="code",
+                hmm_release="hmm",
+                hmm_manifest_sha256="h",
+            )
+            self.assertEqual(result["n_target_shards"], 50)
+            self.assertEqual(result["coverage"]["estimable_mice"], 8)
+            corrupt = root / "targets/0/session_seeds.parquet"
+            corrupt.write_bytes(b"corrupt")
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                aggregate_targets(
+                    root / "targets",
+                    source,
+                    root / "out-corrupt",
+                    cache_release="cache",
+                    cache_manifest_sha256="c",
+                    hmm_prereg_sha256="hp",
+                    hazard_prereg_sha256="vp",
+                    environment_sha256="e",
+                    code_commit="code",
+                    hmm_release="hmm",
+                    hmm_manifest_sha256="h",
+                )
+
+    def test_target_checkpoint_resumes_and_rejects_corruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = []
+
+            def compute():
+                calls.append(1)
+                return {"rows": pd.DataFrame({"value": [1]})}, {"kind": "test"}
+
+            _, tables, resumed = _checkpoint_group(
+                root, "candidate", {"target": 1}, compute
+            )
+            self.assertFalse(resumed)
+            self.assertEqual(tables["rows"].value.iloc[0], 1)
+            _, _, resumed = _checkpoint_group(
+                root, "candidate", {"target": 1}, compute
+            )
+            self.assertTrue(resumed)
+            self.assertEqual(len(calls), 1)
+            (root / "groups/candidate/rows.parquet").write_bytes(b"corrupt")
+            _, _, resumed = _checkpoint_group(
+                root, "candidate", {"target": 1}, compute
+            )
+            self.assertFalse(resumed)
+            self.assertEqual(len(calls), 2)
+
+    def test_preflight_catches_zero_event_before_candidate_grid(self):
+        session = {
+            "behavior": pd.DataFrame({"raw_trial_index": np.arange(25)}),
+            "cells": np.arange(50),
+            "experiment_id": 1,
+            "neural": {},
+        }
+        risk = pd.DataFrame(
+            {
+                "trial_id": np.arange(25),
+                "raw_trial_index": np.arange(25),
+                "event": np.zeros(25, int),
+            }
+        )
+        with patch("pipeline.v4.target.build_risk_rows", return_value=risk):
+            eligible, reason, detail, _, events = _preflight_one(
+                session, np.ones((25, 1))
+            )
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "hazard_tuning_session_ineligible")
+        self.assertEqual(detail, "hazard_no_training_event")
+        self.assertEqual(events, 0)
+        with self.assertRaisesRegex(
+            ValueError, "hazard_tuning_insufficient_sessions"
+        ):
+            require_eligible_sessions([1])
+        self.assertEqual(require_eligible_sessions([3, 2]), (2, 3))
+
+    def test_secondary_failures_do_not_change_primary_seed_status(self):
+        target = {
+            "experiment_id": 1,
+            "behavior_session_id": 2,
+            "mouse_id": 3,
+        }
+        results = {
+            ("primary_k2", "M0", "events", 0): pd.Series(
+                {
+                    "status": "estimable",
+                    "per_trial_loglik": -1.0,
+                    "n_evaluated_trials": 20,
+                    "reason": None,
+                }
+            )
+        }
+        for seed in CELL_SEEDS:
+            results[("primary_k2", "M1", "events", seed)] = pd.Series(
+                {
+                    "status": "estimable",
+                    "per_trial_loglik": -0.9,
+                    "n_evaluated_trials": 20,
+                    "reason": None,
+                }
+            )
+            results[("primary_k2", "M2", "events", seed)] = pd.Series(
+                {
+                    "status": "nonestimable",
+                    "per_trial_loglik": np.nan,
+                    "reason": "hazard_nonconvergence",
+                }
+            )
+            results[("primary_k2", "M1", "dff", seed)] = pd.Series(
+                {
+                    "status": "nonestimable",
+                    "per_trial_loglik": np.nan,
+                    "reason": "hazard_nonrepresentable_prediction",
+                }
+            )
+        frame = assemble_seed_frame(target, "primary_k2", results)
+        self.assertTrue(frame.status.eq("estimable").all())
+        self.assertTrue(frame.m2_status.eq("nonestimable").all())
+        self.assertTrue(frame.dff_status.eq("nonestimable").all())
+
     def test_acceptance_has_no_recovery_or_selection_simulation(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "acceptance.json"
@@ -586,8 +917,8 @@ class AggregateAndWorkflowTests(unittest.TestCase):
                 (shard / "mouse-manifest.json").write_text(
                     json.dumps(
                         {
-                            "schema": "neural-dev-v4-mouse-v2",
-                            "method_revision": "r2",
+                            "schema": "neural-dev-v4-mouse-v3",
+                            "method_revision": "r3",
                             "primary_k": 2,
                             "k_selection_performed": False,
                             "mouse_id": mouse,
@@ -709,10 +1040,10 @@ class AggregateAndWorkflowTests(unittest.TestCase):
         self.assertIn("requirements-v4.txt", v4_action)
         self.assertIn("acceptance", v4_action)
         self.assertIn("dev", v4_action)
-        self.assertIn("Run implementation invariance suite", v4_action)
+        self.assertIn("Run future-information invariance acceptance", v4_action)
         self.assertNotIn("--profile registered", v4_action)
         self.assertNotIn("registered simulation", v4_action.lower())
-        self.assertIn("already exists publicly; r2 cannot be overwritten", v4_action)
+        self.assertIn("is public and cannot be overwritten", v4_action)
         hmm_action = (ROOT / ".github/workflows/neural-dev-v4-hmm.yml").read_text()
         yaml.safe_load(hmm_action)
         self.assertIn("neural-dev-v4-hmm-", hmm_action)
@@ -729,7 +1060,7 @@ class AggregateAndWorkflowTests(unittest.TestCase):
         self.assertIn("key=lambda part: part['name']", cache_action)
         self.assertIn("download_draft_asset", cache_action)
         self.assertIn("Accept: application/octet-stream", cache_action)
-        self.assertIn("Accept: application/octet-stream", v4_action)
+        self.assertIn("target-${TARGET}.tar.gz", v4_action)
         self.assertIn(
             "for container in json.loads(sys.argv[1]):",
             cache_action,
@@ -739,10 +1070,8 @@ class AggregateAndWorkflowTests(unittest.TestCase):
             'gh release download "$CACHE_TAG" -p "$archive"',
             cache_action,
         )
-        self.assertNotIn(
-            'gh release download "$result_tag" -p draft-provenance.json',
-            v4_action,
-        )
+        self.assertIn("run/acceptance/environment-input.sha256", v4_action)
+        self.assertNotIn("run/input/environment-input.sha256", v4_action)
         self.assertNotIn("len(group)==5", v4_action)
         action_text = (cache_action + v4_action + hmm_action).lower()
         self.assertNotIn(".nwb", action_text)
@@ -750,15 +1079,13 @@ class AggregateAndWorkflowTests(unittest.TestCase):
         prereg = (ROOT / "docs/prereg_v4.md").read_text()
         self.assertIn("**Status:** DRAFT", prereg)
         self.assertNotIn("TODO", prereg)
-        self.assertIn(r"p(z_t", prereg)
-        self.assertIn(
-            "The `0.30 s` fixed window, `B-engaged` label, ten-trial transition guard, 20/20",
-            prereg,
-        )
-        self.assertIn("have no role\nin the v4 primary estimand", prereg)
-        self.assertIn(
-            "simulations are not acceptance gates",
-            prereg,
+        self.assertIn(r"\(p(z_t", prereg)
+        self.assertIn("ordinal-bin baseline", prereg)
+        self.assertIn("hazard_no_complete_candidate", prereg)
+        self.assertIn("Acceptance does not run recovery simulation", prereg)
+        self.assertEqual(
+            hashlib.sha256((ROOT / "docs/prereg_v4_r2.md").read_bytes()).hexdigest(),
+            "015e0feec8ec9330ae72121a79c35578fbe82f374e161bda3b2ffceb083bf358",
         )
         requirements = (ROOT / "requirements-v4.txt").read_text().lower()
         requirement_lines = [
@@ -774,6 +1101,15 @@ class AggregateAndWorkflowTests(unittest.TestCase):
         }
         for name, digest in expected.items():
             self.assertEqual(hashlib.sha256((ROOT / name).read_bytes()).hexdigest(), digest)
+
+    def test_hazard_plan_is_exact_50_and_json_scalar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.csv"
+            _uneven_source_manifest().to_csv(path, index=False)
+            plan = hazard_plan(path)
+            self.assertEqual(plan["n_targets"], 50)
+            self.assertEqual(len(plan["targets"]), 50)
+            json.dumps(plan)
 
 
 if __name__ == "__main__":

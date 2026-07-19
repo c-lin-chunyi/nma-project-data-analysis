@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import tempfile
 from types import SimpleNamespace
 from dataclasses import asdict
 from pathlib import Path
@@ -27,6 +28,7 @@ from .constants import (
     RESULT_SCHEMA,
     RIDGE_GRID,
     TYPED_REASONS,
+    TARGET_SCHEMA,
 )
 from .hazard import (
     build_risk_rows,
@@ -372,7 +374,9 @@ def fit_mouse(
     hmm_manifest = json.loads(hmm_manifest_path.read_text())
     expected_hmm = {
         "schema": "neural-dev-v4-hmm-release-v1",
-        "method_revision": METHOD_REVISION,
+        # Local r2 mouse-wrapper compatibility only.  Formal r3 execution
+        # validates separate HMM/hazard prereg hashes in fit_target.
+        "method_revision": "r2",
         "primary_k": PRIMARY_HMM_K,
         "k_selection_performed": False,
         "cache_release": cache_release,
@@ -731,7 +735,11 @@ def aggregate(
                 "m2_minus_m1": float(group.m2_minus_m1.mean())
                 if group.m2_minus_m1.notna().all()
                 else np.nan,
-                "dff_delta_ll": float(group.dff_delta_ll.mean()),
+                "dff_delta_ll": (
+                    float(group.dff_delta_ll.mean())
+                    if group.dff_delta_ll.notna().all()
+                    else np.nan
+                ),
             }
         )
     sessions = pd.DataFrame(
@@ -762,7 +770,16 @@ def aggregate(
                 )
                 if group.m2_minus_m1.notna().any()
                 else np.nan,
-                "dff_delta_ll": float(np.average(group.dff_delta_ll, weights=weights)),
+                "dff_delta_ll": float(
+                    np.average(
+                        group.loc[group.dff_delta_ll.notna(), "dff_delta_ll"],
+                        weights=group.loc[
+                            group.dff_delta_ll.notna(), "n_evaluated_trials"
+                        ],
+                    )
+                )
+                if group.dff_delta_ll.notna().any()
+                else np.nan,
             }
         )
     mice = pd.DataFrame(
@@ -947,9 +964,10 @@ def aggregate(
             "m2_minus_m1": {
                 "status": (
                     "estimable"
-                    if len(mice) and mice.m2_minus_m1.notna().any()
-                    else "not_applicable_or_nonestimable"
+                    if mice.m2_minus_m1.notna().sum() >= REQUIRED_MICE
+                    else "nonestimable_mouse_coverage"
                 ),
+                "n_estimable_mice": int(mice.m2_minus_m1.notna().sum()),
                 "mouse_mean": (
                     float(mice.m2_minus_m1.mean())
                     if len(mice) and mice.m2_minus_m1.notna().any()
@@ -957,9 +975,16 @@ def aggregate(
                 ),
             },
             "dff_replication": {
-                "status": "estimable" if len(mice) else "nonestimable",
+                "status": (
+                    "estimable"
+                    if mice.dff_delta_ll.notna().sum() >= REQUIRED_MICE
+                    else "nonestimable_mouse_coverage"
+                ),
+                "n_estimable_mice": int(mice.dff_delta_ll.notna().sum()),
                 "m1_minus_m0_mouse_mean": (
-                    float(mice.dff_delta_ll.mean()) if len(mice) else None
+                    float(mice.dff_delta_ll.mean())
+                    if mice.dff_delta_ll.notna().any()
+                    else None
                 ),
             },
         },
@@ -1003,4 +1028,220 @@ def aggregate(
         "allen_nwb_download": False,
     }
     (out / "analysis-manifest.json").write_text(json.dumps(result, indent=2) + "\n")
+    return result
+
+
+def aggregate_targets(
+    target_results: Path,
+    manifest_path: Path,
+    out: Path,
+    *,
+    cache_release: str,
+    cache_manifest_sha256: str,
+    hmm_prereg_sha256: str,
+    hazard_prereg_sha256: str,
+    environment_sha256: str,
+    code_commit: str,
+    hmm_release: str,
+    hmm_manifest_sha256: str,
+) -> dict:
+    """Strictly validate 50 r3 target shards, then use registered aggregation."""
+
+    source = pd.read_csv(manifest_path)
+    active = source[source.role.eq("active")]
+    expected_targets = sorted(active.behavior_session_id.astype(int).unique())
+    expected_mice = sorted(active.mouse_id.astype(int).unique())
+    if len(expected_targets) != 50 or len(expected_mice) != 10:
+        raise ValueError("aggregate requires exact 50 active targets / 10 mice")
+    located = sorted(target_results.rglob("target-manifest.json"))
+    manifests = [json.loads(path.read_text()) for path in located]
+    found = [int(item.get("target_session", -1)) for item in manifests]
+    if len(found) != len(set(found)):
+        raise ValueError("duplicate target shard")
+    if sorted(found) != expected_targets:
+        raise ValueError(
+            f"target shard mismatch expected={expected_targets} found={sorted(found)}"
+        )
+    expected = {
+        "schema": TARGET_SCHEMA,
+        "method_revision": METHOD_REVISION,
+        "cache_release": cache_release,
+        "cache_manifest_sha256": cache_manifest_sha256,
+        "hmm_release": hmm_release,
+        "hmm_manifest_sha256": hmm_manifest_sha256,
+        "hmm_prereg_sha256": hmm_prereg_sha256,
+        "hazard_prereg_sha256": hazard_prereg_sha256,
+        "environment_sha256": environment_sha256,
+        "code_commit": code_commit,
+        "status": "complete",
+        "numeric_sesoi": None,
+        "confirm_ready": False,
+        "confirm_data_accessed": False,
+    }
+    for item in manifests:
+        for key, value in expected.items():
+            if item.get(key) != value:
+                raise ValueError(
+                    f"target {item.get('target_session')} {key} mismatch"
+                )
+
+    paths_by_target = {
+        int(json.loads(path.read_text())["target_session"]): path.parent
+        for path in located
+    }
+    for item in manifests:
+        root = paths_by_target[int(item["target_session"])]
+        for name, digest in item.get("files", {}).items():
+            path = root / name
+            if not path.is_file() or _sha256(path) != digest:
+                raise ValueError(
+                    f"target {item['target_session']} checksum mismatch: {name}"
+                )
+    with tempfile.TemporaryDirectory(prefix="neural-dev-v4-r3-aggregate-") as tmp:
+        mouse_root = Path(tmp)
+        for mouse_id in expected_mice:
+            target_ids = sorted(
+                active.loc[
+                    active.mouse_id.astype(int).eq(mouse_id),
+                    "behavior_session_id",
+                ].astype(int)
+            )
+            mouse_dir = mouse_root / f"mouse-{mouse_id}"
+            mouse_dir.mkdir()
+            seeds = pd.concat(
+                [
+                    pd.read_parquet(paths_by_target[target] / "session_seeds.parquet")
+                    for target in target_ids
+                ],
+                ignore_index=True,
+            )
+            k1 = pd.concat(
+                [
+                    pd.read_parquet(
+                        paths_by_target[target] / "k1_hazard_sensitivity.parquet"
+                    )
+                    for target in target_ids
+                ],
+                ignore_index=True,
+            )
+            behavior = pd.concat(
+                [
+                    pd.read_parquet(
+                        paths_by_target[target] / "behavior_sensitivity.parquet"
+                    )
+                    for target in target_ids
+                ],
+                ignore_index=True,
+            ).drop_duplicates()
+            failure_frames = []
+            for target in target_ids:
+                path = paths_by_target[target] / "typed_failures.parquet"
+                frame = pd.read_parquet(path)
+                if not frame.empty:
+                    frame["behavior_session_id"] = target
+                    failure_frames.append(frame)
+            failures = (
+                [
+                    {
+                        "behavior_session_id": int(
+                            row.get("behavior_session_id", -1)
+                        ),
+                        "analysis": (
+                            None
+                            if pd.isna(row.get("analysis"))
+                            else str(row.get("analysis"))
+                        ),
+                        "reason": (
+                            "source_integrity_failure"
+                            if pd.isna(row.get("reason"))
+                            else str(row.get("reason"))
+                        ),
+                        "detail": (
+                            None
+                            if pd.isna(row.get("detail"))
+                            else str(row.get("detail"))
+                        ),
+                        "exception_type": (
+                            None
+                            if pd.isna(row.get("exception_type"))
+                            else str(row.get("exception_type"))
+                        ),
+                    }
+                    for row in pd.concat(
+                        failure_frames, ignore_index=True
+                    ).to_dict("records")
+                ]
+                if failure_frames
+                else []
+            )
+            seeds.to_parquet(mouse_dir / "session_seeds.parquet", index=False)
+            k1.to_parquet(
+                mouse_dir / "k1_hazard_sensitivity.parquet", index=False
+            )
+            behavior.to_parquet(
+                mouse_dir / "behavior_sensitivity.parquet", index=False
+            )
+            valid_sessions = seeds.loc[
+                seeds.get(
+                    "status", pd.Series(index=seeds.index, dtype=str)
+                ).eq("estimable"),
+                "behavior_session_id",
+            ].nunique()
+            target_items = [
+                manifests[found.index(target)] for target in target_ids
+            ]
+            mouse_manifest = {
+                "schema": MOUSE_SCHEMA,
+                "method_revision": METHOD_REVISION,
+                "primary_k": PRIMARY_HMM_K,
+                "k_selection_performed": False,
+                "mouse_id": int(mouse_id),
+                "cache_release": cache_release,
+                "cache_manifest_sha256": cache_manifest_sha256,
+                "prereg_sha256": hazard_prereg_sha256,
+                "hmm_prereg_sha256": hmm_prereg_sha256,
+                "environment_sha256": environment_sha256,
+                "hmm_release": hmm_release,
+                "hmm_manifest_sha256": hmm_manifest_sha256,
+                "n_expected_sessions": len(target_ids),
+                "n_estimable_sessions": int(valid_sessions),
+                "status": "estimable" if valid_sessions else "nonestimable",
+                "diagnostics_complete": all(
+                    item.get("diagnostics_complete") is True
+                    for item in target_items
+                ),
+                "failures": failures,
+                "typed_reasons": sorted(
+                    {
+                        reason
+                        for item in target_items
+                        for reason in item.get("typed_reasons", [])
+                    }
+                ),
+                "numeric_sesoi": None,
+                "confirm_ready": False,
+                "confirm_data_accessed": False,
+                "allen_nwb_download": False,
+            }
+            (mouse_dir / "mouse-manifest.json").write_text(
+                json.dumps(mouse_manifest, indent=2, sort_keys=True) + "\n"
+            )
+        result = aggregate(
+            mouse_root,
+            manifest_path,
+            out,
+            cache_release=cache_release,
+            cache_manifest_sha256=cache_manifest_sha256,
+            prereg_sha256=hazard_prereg_sha256,
+            environment_sha256=environment_sha256,
+            hmm_release=hmm_release,
+            hmm_manifest_sha256=hmm_manifest_sha256,
+        )
+    result["hmm_prereg_sha256"] = hmm_prereg_sha256
+    result["hazard_prereg_sha256"] = hazard_prereg_sha256
+    result["target_schema"] = TARGET_SCHEMA
+    result["n_target_shards"] = 50
+    (out / "analysis-manifest.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n"
+    )
     return result

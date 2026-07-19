@@ -5,9 +5,13 @@ from __future__ import annotations
 CACHE_SCHEMA = "neural-dev-time-cache-v2"
 HMM_CHECKPOINT_SCHEMA = "neural-dev-v4-hmm-checkpoint-v1"
 HMM_RELEASE_SCHEMA = "neural-dev-v4-hmm-release-v1"
-MOUSE_SCHEMA = "neural-dev-v4-mouse-v2"
+HMM_METHOD_REVISION = "r2"
+MOUSE_SCHEMA = "neural-dev-v4-mouse-v3"
+TARGET_SCHEMA = "neural-dev-v4-target-v1"
+HAZARD_PLAN_SCHEMA = "neural-dev-v4-hazard-plan-v1"
+HAZARD_CHECKPOINT_SCHEMA = "neural-dev-v4-hazard-checkpoint-v1"
 RESULT_SCHEMA = "neural-dev-v4"
-METHOD_REVISION = "r2"
+METHOD_REVISION = "r3"
 
 WINDOW_START = -1.25
 WINDOW_END = 0.75
@@ -60,7 +64,9 @@ TYPED_REASONS = {
     "neural_fewer_than_50_cells",
     "hazard_no_training_event",
     "hazard_tuning_insufficient_sessions",
-    "hazard_candidate_failure",
+    "hazard_tuning_session_ineligible",
+    "hazard_no_complete_candidate",
+    "hazard_nonrepresentable_prediction",
     "hazard_nonconvergence",
     "hazard_incomplete_prediction",
     "hazard_empty_test_block",

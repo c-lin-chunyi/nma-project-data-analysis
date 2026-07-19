@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from functools import lru_cache
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
@@ -374,15 +375,87 @@ class HazardFit:
     model: str
     success: bool
     objective: float
+    gradient_norm: float
+    optimizer_status: int
+    optimizer_message: str
+    min_eta: float
+    max_eta: float
+    tail_low_count: int
+    tail_high_count: int
+    protection_count: int
+    runtime_seconds: float
 
 
-def _cloglog_components(eta):
+class HazardFitFailure(ValueError):
+    def __init__(self, reason: str, diagnostics: Mapping[str, object]):
+        super().__init__(reason)
+        self.reason = reason
+        self.diagnostics = dict(diagnostics)
+
+
+class HazardEvaluationFailure(ValueError):
+    def __init__(
+        self,
+        reason: str,
+        block_rows: Sequence[Mapping],
+        coefficient_rows: Sequence[Mapping],
+    ):
+        super().__init__(reason)
+        self.reason = reason
+        self.block_rows = list(block_rows)
+        self.coefficient_rows = list(coefficient_rows)
+
+
+_EVENT_LOW = -36.0
+_EVENT_HIGH = 36.0
+# exp(650) is finite with ample room for summing realistic risk sets.  Above
+# this point the survival term uses a finite C1 saturating continuation with
+# the exact derivative at the join.  A final fit/prediction that still needs
+# this branch for a non-event row is rejected rather than reported as an
+# approximation.
+_SURVIVAL_GUARD = 650.0
+_SURVIVAL_EXTENSION_SCALE = 1e20
+_RIDGE_GUARD = 1e140
+
+
+def _cloglog_value_derivative(eta, event):
+    """Stable row log likelihood and analytic derivative with respect to eta."""
+
     import jax.numpy as jnp
 
-    cumulative = jnp.exp(eta)
-    log_survival = -cumulative
-    log_event = jnp.log(-jnp.expm1(-cumulative))
-    return log_event, log_survival
+    clipped = jnp.clip(eta, _EVENT_LOW, _EVENT_HIGH)
+    cumulative = jnp.exp(clipped)
+    event_value_middle = jnp.log(-jnp.expm1(-cumulative))
+    gradient_argument = jnp.minimum(cumulative, 50.0)
+    event_gradient_middle = jnp.where(
+        cumulative > 50.0,
+        0.0,
+        cumulative / jnp.expm1(gradient_argument),
+    )
+    event_value = jnp.where(
+        eta < _EVENT_LOW,
+        eta,
+        jnp.where(eta > _EVENT_HIGH, 0.0, event_value_middle),
+    )
+    event_gradient = jnp.where(
+        eta < _EVENT_LOW,
+        1.0,
+        jnp.where(eta > _EVENT_HIGH, 0.0, event_gradient_middle),
+    )
+
+    guarded = jnp.minimum(eta, _SURVIVAL_GUARD)
+    cumulative_guarded = jnp.exp(guarded)
+    excess = jnp.maximum(eta - _SURVIVAL_GUARD, 0.0)
+    extension = jnp.tanh(excess / _SURVIVAL_EXTENSION_SCALE)
+    survival_value = -cumulative_guarded * (
+        1.0 + _SURVIVAL_EXTENSION_SCALE * extension
+    )
+    survival_gradient = -cumulative_guarded * (1.0 - extension**2)
+    is_event = event == 1
+    return (
+        jnp.where(is_event, event_value, survival_value),
+        jnp.where(is_event, event_gradient, survival_gradient),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -392,33 +465,97 @@ def _hazard_value_and_grad():
     import jax
     import jax.numpy as jnp
 
-    def objective(beta, design, event, offset, penalty, ridge_mask):
+    def objective_and_gradient(beta, design, event, offset, penalty, ridge_mask):
         eta = offset + design @ beta
-        log_event, log_survival = _cloglog_components(eta)
-        loglik = jnp.sum(jnp.where(event == 1, log_event, log_survival))
-        ridge = penalty * jnp.sum((beta * ridge_mask) ** 2)
-        return -loglik + ridge
+        loglik_rows, eta_gradient = _cloglog_value_derivative(eta, event)
+        loglik = jnp.sum(loglik_rows)
+        absolute = jnp.abs(beta)
+        excess = jnp.maximum(absolute - _RIDGE_GUARD, 0.0)
+        extension = jnp.tanh(excess / _RIDGE_GUARD)
+        guarded_square = jnp.minimum(absolute, _RIDGE_GUARD) ** 2
+        square = jnp.where(
+            absolute <= _RIDGE_GUARD,
+            guarded_square,
+            _RIDGE_GUARD**2
+            + 2.0 * _RIDGE_GUARD**2 * extension,
+        )
+        square_gradient = jnp.where(
+            absolute <= _RIDGE_GUARD,
+            2.0 * beta,
+            2.0
+            * _RIDGE_GUARD
+            * (1.0 - extension**2)
+            * jnp.sign(beta),
+        )
+        ridge = penalty * jnp.sum(square * ridge_mask)
+        value = -loglik + ridge
+        gradient = -(design.T @ eta_gradient) + (
+            penalty * square_gradient * ridge_mask
+        )
+        return value, gradient
 
-    return jax.jit(jax.value_and_grad(objective))
+    return jax.jit(objective_and_gradient)
 
 
-def fit_hazard(rows: pd.DataFrame, *, model: str, penalty: float) -> HazardFit:
+@dataclass
+class PreparedHazard:
+    rows: pd.DataFrame
+    design: np.ndarray
+    event: np.ndarray
+    offset: np.ndarray
+    transform: DesignTransform
+    baseline_count: int
+    model: str
+
+
+@dataclass
+class PreparedFold:
+    test_block: int
+    train_max_raw_index: int
+    test_min_raw_index: int
+    train: PreparedHazard
+    test_rows: pd.DataFrame
+    test_design: np.ndarray
+
+
+def prepare_hazard(rows: pd.DataFrame, *, model: str) -> PreparedHazard:
+    if rows.empty or int(rows.event.sum()) == 0:
+        raise ValueError("hazard_no_training_event")
+    design, transform, baseline_count = fit_transform(rows, model)
+    return PreparedHazard(
+        rows=rows,
+        design=np.asarray(design, np.float64),
+        event=rows.event.to_numpy(np.float64),
+        offset=rows.offset.to_numpy(np.float64),
+        transform=transform,
+        baseline_count=baseline_count,
+        model=model,
+    )
+
+
+def ridge_mask(n_coefficients: int) -> np.ndarray:
+    """r3 penalty mask: every fitted coefficient, including baseline, is one."""
+
+    return np.ones(int(n_coefficients), np.float64)
+
+
+def fit_prepared(prepared: PreparedHazard, *, penalty: float) -> HazardFit:
     import jax
 
     jax.config.update("jax_enable_x64", True)
     import jax.numpy as jnp
     from scipy.optimize import minimize
 
-    if int(rows.event.sum()) == 0:
-        raise ValueError("hazard_no_training_event")
-    design, transform, baseline_count = fit_transform(rows, model)
-    y = rows.event.to_numpy(float)
-    offset = rows.offset.to_numpy(float)
-    xj, yj, oj = map(jnp.asarray, (design, y, offset))
+    started = time.monotonic()
+    design = prepared.design
+    xj, yj, oj = map(
+        jnp.asarray, (design, prepared.event, prepared.offset)
+    )
 
-    ridge_mask = np.ones(design.shape[1], float)
-    ridge_mask[:baseline_count] = 0.0
-    rj = jnp.asarray(ridge_mask)
+    # r3: the ordinal-bin baseline receives the same candidate ridge penalty
+    # as every other fitted coefficient.  The offset is not a coefficient.
+    penalty_mask = ridge_mask(design.shape[1])
+    rj = jnp.asarray(penalty_mask)
     value_grad = _hazard_value_and_grad()
 
     def wrapped(beta):
@@ -440,36 +577,218 @@ def fit_hazard(rows: pd.DataFrame, *, model: str, penalty: float) -> HazardFit:
         and np.all(np.isfinite(result.x))
         and np.all(np.isfinite(result.jac))
     )
+    beta = np.asarray(result.x, float)
+    eta = prepared.offset + design @ beta
+    protection_count = int(
+        np.count_nonzero((prepared.event == 0) & (eta > _SURVIVAL_GUARD))
+    )
+    finite_eta = eta[np.isfinite(eta)]
+    diagnostics = {
+        "objective": float(result.fun) if np.isfinite(result.fun) else np.nan,
+        "gradient_norm": (
+            float(np.linalg.norm(np.asarray(result.jac, float)))
+            if np.all(np.isfinite(result.jac))
+            else np.nan
+        ),
+        "optimizer_status": int(result.status),
+        "optimizer_message": str(result.message),
+        "min_eta": float(np.min(finite_eta)) if len(finite_eta) else np.nan,
+        "max_eta": float(np.max(finite_eta)) if len(finite_eta) else np.nan,
+        "tail_low_count": int(np.count_nonzero(eta < _EVENT_LOW)),
+        "tail_high_count": int(np.count_nonzero(eta > _EVENT_HIGH)),
+        "protection_count": protection_count,
+        "runtime_seconds": float(time.monotonic() - started),
+    }
     if not success:
-        raise ValueError("hazard_nonconvergence")
+        raise HazardFitFailure("hazard_nonconvergence", diagnostics)
+    if protection_count:
+        raise HazardFitFailure(
+            "hazard_nonrepresentable_prediction", diagnostics
+        )
     return HazardFit(
-        beta=np.asarray(result.x, float),
-        transform=transform,
-        baseline_count=baseline_count,
+        beta=beta,
+        transform=prepared.transform,
+        baseline_count=prepared.baseline_count,
         penalty=float(penalty),
-        model=model,
+        model=prepared.model,
         success=True,
-        objective=float(result.fun),
+        **diagnostics,
     )
 
 
-def score_hazard(fit: HazardFit, rows: pd.DataFrame) -> tuple[float, int, pd.DataFrame]:
-    design, _ = apply_transform(rows, fit.transform)
+def fit_hazard(rows: pd.DataFrame, *, model: str, penalty: float) -> HazardFit:
+    return fit_prepared(prepare_hazard(rows, model=model), penalty=penalty)
+
+
+def _numpy_cloglog(eta: np.ndarray, event: np.ndarray) -> np.ndarray:
+    eta = np.asarray(eta, np.float64)
+    event = np.asarray(event, np.int8)
+    result = np.empty_like(eta)
+    event_rows = event == 1
+    low = event_rows & (eta < _EVENT_LOW)
+    high = event_rows & (eta > _EVENT_HIGH)
+    middle = event_rows & ~low & ~high
+    result[low] = eta[low]
+    result[high] = 0.0
+    z = np.exp(eta[middle])
+    result[middle] = np.log(-np.expm1(-z))
+    survival = ~event_rows
+    survival_eta = eta[survival]
+    survival_value = np.zeros_like(survival_eta)
+    representable = survival_eta >= np.log(np.finfo(np.float64).tiny)
+    guarded = np.minimum(
+        survival_eta[representable], _SURVIVAL_GUARD
+    )
+    excess = np.maximum(
+        survival_eta[representable] - _SURVIVAL_GUARD, 0.0
+    )
+    survival_value[representable] = -np.exp(guarded) * (
+        1.0
+        + _SURVIVAL_EXTENSION_SCALE
+        * np.tanh(excess / _SURVIVAL_EXTENSION_SCALE)
+    )
+    result[survival] = survival_value
+    return result
+
+
+def score_design(
+    fit: HazardFit, rows: pd.DataFrame, design: np.ndarray
+) -> tuple[float, int, pd.DataFrame]:
     eta = rows.offset.to_numpy(float) + design @ fit.beta
-    cumulative = np.exp(eta)
-    log_survival = -cumulative
-    log_event = np.log(-np.expm1(-cumulative))
-    contributions = np.where(rows.event.to_numpy(int) == 1, log_event, log_survival)
+    event = rows.event.to_numpy(int)
+    if np.any((event == 0) & (eta > _SURVIVAL_GUARD)):
+        raise ValueError("hazard_nonrepresentable_prediction")
+    contributions = _numpy_cloglog(eta, event)
     if not np.all(np.isfinite(contributions)):
-        raise ValueError("hazard_incomplete_prediction")
+        raise ValueError("hazard_nonrepresentable_prediction")
     diagnostic = rows[["trial_id", "raw_trial_index", "bin_index", "event"]].copy()
     diagnostic["loglik"] = contributions
     per_trial = diagnostic.groupby("trial_id", sort=False).loglik.sum()
     return float(per_trial.sum()), int(len(per_trial)), diagnostic
 
 
+def score_hazard(fit: HazardFit, rows: pd.DataFrame) -> tuple[float, int, pd.DataFrame]:
+    design, _ = apply_transform(rows, fit.transform)
+    return score_design(fit, rows, design)
+
+
 def raw_blocks(n_trials: int) -> list[np.ndarray]:
     return [np.asarray(block, int) for block in np.array_split(np.arange(n_trials), N_BLOCKS)]
+
+
+def prepare_prequential(
+    rows: pd.DataFrame,
+    *,
+    n_raw_trials: int,
+    model: str,
+) -> list[PreparedFold]:
+    blocks = raw_blocks(n_raw_trials)
+    prepared: list[PreparedFold] = []
+    for block_index in range(1, N_BLOCKS):
+        train_limit = int(blocks[block_index - 1][-1])
+        test_indices = set(map(int, blocks[block_index]))
+        train = rows[rows.raw_trial_index <= train_limit].copy()
+        test = rows[rows.raw_trial_index.isin(test_indices)].copy()
+        if test.empty:
+            raise ValueError("hazard_empty_test_block")
+        fitted = prepare_hazard(train, model=model)
+        test_design, _ = apply_transform(test, fitted.transform)
+        prepared.append(
+            PreparedFold(
+                test_block=block_index + 1,
+                train_max_raw_index=train_limit,
+                test_min_raw_index=min(test_indices),
+                train=fitted,
+                test_rows=test,
+                test_design=np.asarray(test_design, np.float64),
+            )
+        )
+    return prepared
+
+
+def evaluate_prepared(
+    folds: Sequence[PreparedFold], *, penalty: float
+) -> tuple[float, int, list[dict], list[dict]]:
+    total, trials = 0.0, 0
+    block_rows: list[dict] = []
+    coefficient_rows: list[dict] = []
+    failure_reasons: list[str] = []
+    for fold in folds:
+        base = {
+            "test_block": fold.test_block,
+            "train_max_raw_index": fold.train_max_raw_index,
+            "test_min_raw_index": fold.test_min_raw_index,
+            "n_train_rows": len(fold.train.rows),
+            "n_test_rows": len(fold.test_rows),
+        }
+        try:
+            fit = fit_prepared(fold.train, penalty=penalty)
+            score, count, _ = score_design(
+                fit, fold.test_rows, fold.test_design
+            )
+        except Exception as exc:
+            if isinstance(exc, MemoryError) or type(exc).__name__ in {
+                "XlaRuntimeError",
+                "JaxRuntimeError",
+            }:
+                raise
+            reason = str(exc)
+            failure_reasons.append(reason)
+            diagnostic = (
+                exc.diagnostics if isinstance(exc, HazardFitFailure) else {}
+            )
+            block_rows.append(
+                {
+                    **base,
+                    "n_test_trials": 0,
+                    "loglik": np.nan,
+                    "status": "nonestimable",
+                    "reason": reason,
+                    "detail": str(exc),
+                    "exception_type": type(exc).__name__,
+                    **diagnostic,
+                }
+            )
+            continue
+        total += score
+        trials += count
+        block_rows.append(
+            {
+                **base,
+                "n_test_trials": count,
+                "loglik": score,
+                "status": "estimable",
+                "reason": None,
+                "detail": None,
+                "exception_type": None,
+                "objective": fit.objective,
+                "gradient_norm": fit.gradient_norm,
+                "optimizer_status": fit.optimizer_status,
+                "optimizer_message": fit.optimizer_message,
+                "min_eta": fit.min_eta,
+                "max_eta": fit.max_eta,
+                "tail_low_count": fit.tail_low_count,
+                "tail_high_count": fit.tail_high_count,
+                "protection_count": fit.protection_count,
+                "runtime_seconds": fit.runtime_seconds,
+            }
+        )
+        coefficient_rows.extend(
+            {
+                "test_block": fold.test_block,
+                "coefficient_index": index,
+                "coefficient": float(value),
+                "model": fold.train.model,
+            }
+            for index, value in enumerate(fit.beta)
+        )
+    if failure_reasons:
+        raise HazardEvaluationFailure(
+            failure_reasons[0], block_rows, coefficient_rows
+        )
+    if trials == 0:
+        raise ValueError("hazard_empty_test_block")
+    return total / trials, trials, block_rows, coefficient_rows
 
 
 def evaluate_prequential(
@@ -479,60 +798,50 @@ def evaluate_prequential(
     model: str,
     penalty: float,
 ) -> tuple[float, int, list[dict], list[dict]]:
-    blocks = raw_blocks(n_raw_trials)
-    total, trials = 0.0, 0
-    block_rows: list[dict] = []
-    coefficient_rows: list[dict] = []
-    for block_index in range(1, N_BLOCKS):
-        train_limit = int(blocks[block_index - 1][-1])
-        test_indices = set(map(int, blocks[block_index]))
-        train = rows[rows.raw_trial_index <= train_limit].copy()
-        test = rows[rows.raw_trial_index.isin(test_indices)].copy()
-        if test.empty:
-            raise ValueError("hazard_empty_test_block")
-        fit = fit_hazard(train, model=model, penalty=penalty)
-        score, count, diagnostics = score_hazard(fit, test)
-        total += score
-        trials += count
-        block_rows.append(
-            {
-                "test_block": block_index + 1,
-                "train_max_raw_index": train_limit,
-                "test_min_raw_index": min(test_indices),
-                "n_train_rows": len(train),
-                "n_test_rows": len(test),
-                "n_test_trials": count,
-                "loglik": score,
-            }
-        )
-        coefficient_rows.extend(
-            {
-                "test_block": block_index + 1,
-                "coefficient_index": index,
-                "coefficient": float(value),
-                "model": model,
-            }
-            for index, value in enumerate(fit.beta)
-        )
-    if trials == 0:
-        raise ValueError("hazard_empty_test_block")
-    return total / trials, trials, block_rows, coefficient_rows
+    return evaluate_prepared(
+        prepare_prequential(rows, n_raw_trials=n_raw_trials, model=model),
+        penalty=penalty,
+    )
 
 
 def one_se_hazard(
-    candidate_rows: pd.DataFrame, *, model: str
+    candidate_rows: pd.DataFrame,
+    *,
+    model: str,
+    eligible_sessions: Sequence[int] | None = None,
 ) -> tuple[int | None, float]:
-    valid = candidate_rows[candidate_rows.status.eq("estimable")]
-    if len(valid) != len(candidate_rows):
-        raise ValueError("hazard_candidate_failure")
+    if candidate_rows.empty:
+        raise ValueError("hazard_no_complete_candidate")
+    expected_sessions = set(
+        map(
+            int,
+            eligible_sessions
+            if eligible_sessions is not None
+            else candidate_rows.tuning_session.unique(),
+        )
+    )
+    valid = candidate_rows[candidate_rows.status.eq("estimable")].copy()
     grouping = ["tuning_session", "basis_count", "penalty"]
+    complete_keys: list[tuple[float, float]] = []
+    for (basis, penalty), group in candidate_rows.groupby(
+        ["basis_count", "penalty"], dropna=False
+    ):
+        sessions = set(map(int, group.tuning_session.unique()))
+        if sessions != expected_sessions or not group.status.eq("estimable").all():
+            continue
+        if model != "M0":
+            counts = group.groupby("tuning_session").cell_seed.nunique()
+            if (
+                set(map(int, counts.index)) != expected_sessions
+                or not counts.eq(len(CELL_SEEDS)).all()
+            ):
+                continue
+        complete_keys.append((float(basis), float(penalty)))
+    if not complete_keys:
+        raise ValueError("hazard_no_complete_candidate")
+    complete = pd.DataFrame(complete_keys, columns=["basis_count", "penalty"])
+    valid = valid.merge(complete, on=["basis_count", "penalty"], how="inner")
     if model != "M0":
-        expected_seeds = set(map(int, valid.cell_seed.dropna().unique()))
-        if len(expected_seeds) != len(CELL_SEEDS):
-            raise ValueError("hazard_candidate_failure")
-        counts = valid.groupby(grouping, dropna=False).cell_seed.nunique()
-        if not counts.eq(len(CELL_SEEDS)).all():
-            raise ValueError("hazard_candidate_failure")
         # The registered aggregation averages cell seeds within each tuning
         # session before using sessions as the independent units for the SE.
         session_scores = (
