@@ -571,6 +571,97 @@ def scan(b: Path, sweep: bool, ids_from: Path | None = None) -> int:
     return 0
 
 
+def confirm_labels(b: Path, ids_from: Path) -> int:
+    """Emit only the frozen v3.4 labels and eligibility tables.
+
+    This deliberately omits every DEV sweep, alternative construct table,
+    persistence analysis, and survival model.  The shared ``label_session``
+    function keeps the Piet-B construction byte-for-byte aligned with v3.3.
+    """
+    ids = validate_bundle_set(b, ids_from)
+    expected = pd.read_csv(ids_from)
+    required = {"behavior_session_id", "ophys_experiment_id",
+                "ophys_container_id", "mouse_id", "project_code",
+                "session_type"}
+    if not required.issubset(expected.columns):
+        raise ValueError(
+            f"v3.4 ID table missing {sorted(required-set(expected.columns))}")
+    if (len(ids) != 130 or len(expected) != 130 or
+            expected.ophys_experiment_id.astype(int).nunique() != 130 or
+            expected.behavior_session_id.astype(int).nunique() != 130 or
+            expected.mouse_id.astype(int).nunique() != 29 or
+            expected.ophys_container_id.astype(int).nunique() != 29 or
+            expected.session_type.astype(str).str.contains(
+                "passive", case=False, regex=False).any()):
+        raise ValueError(
+            "v3.4 labels require exact 130 sessions / 29 mice / 29 containers")
+
+    label_rows, session_rows = [], []
+    for bsid in ids:
+        tr, sp, lk, earned, md = load(b, bsid)
+        labels, session, _ = label_session(tr, sp, lk, earned)
+        identity = expected.loc[
+            expected.behavior_session_id.astype(int).eq(int(bsid))].iloc[0]
+        common = {
+            "behavior_session_id": int(bsid),
+            "mouse_id": int(identity.mouse_id),
+            "project_code": str(identity.project_code),
+            "session_type": str(identity.session_type),
+        }
+        labels = labels[[
+            "trial_id", "trial_index", "start_time", "stop_time", "change_time",
+            "late_hit", "miss", "engaged_B", "keep_B", "first_ten",
+            "is_image_novel",
+        ]].copy()
+        labels.insert(0, "behavior_session_id", int(bsid))
+        for key, value in reversed(list(common.items())[1:]):
+            labels.insert(1, key, value)
+        label_rows.append(labels)
+        reasons = []
+        if int(session["late_hit_B"]) < MIN_LATE_HIT:
+            reasons.append("low_late_hit")
+        if int(session["miss_B"]) < MIN_MISS:
+            reasons.append("low_miss")
+        session_rows.append({
+            **common,
+            "late_hit_B": int(session["late_hit_B"]),
+            "miss_B": int(session["miss_B"]),
+            "behavioral_eligible": not reasons,
+            "eligibility_reasons": ";".join(reasons),
+        })
+
+    trials = pd.concat(label_rows, ignore_index=True)
+    sessions = pd.DataFrame(session_rows)
+    trials.to_parquet(b / "_trial_labels.parquet", index=False)
+    sessions.to_parquet(b / "_session_scan.parquet", index=False)
+    sessions.to_parquet(b / "_eligibility.parquet", index=False)
+    ids_sha = hashlib.sha256(
+        "\n".join(map(str, sorted(ids))).encode()).hexdigest()
+    manifest = {
+        "schema": "behavioral-confirm-v3.4",
+        "confirm_ids_sha256": ids_sha,
+        "confirm_table_sha256": hashlib.sha256(ids_from.read_bytes()).hexdigest(),
+        "n_sessions": len(ids),
+        "n_mice": int(sessions.mouse_id.nunique()),
+        "parameters": {
+            "bout_gap": BOUT_GAP, "half_win": HALF_WIN,
+            "rr_piet": RR_PIET, "br_piet": BR_PIET, "guard": GUARD,
+            "fit_end": FIT_END, "min_late_hit": MIN_LATE_HIT,
+            "min_miss": MIN_MISS,
+        },
+        "files": ["_trial_labels.parquet", "_session_scan.parquet",
+                  "_eligibility.parquet"],
+        "construct_sweep_performed": False,
+        "threshold_sweep_performed": False,
+    }
+    (b / "behavioral-manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n")
+    print(f"CONFIRM v3.4 labels: {len(ids)} sessions / "
+          f"{sessions.mouse_id.nunique()} mice; "
+          f"eligible={int(sessions.behavioral_eligible.sum())}")
+    return 0
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     s = ap.add_subparsers(dest="cmd", required=True)
@@ -584,10 +675,15 @@ if __name__ == "__main__":
     q.add_argument("dir", type=Path)
     q.add_argument("--ids-from", type=Path)
     q.add_argument("--sweep", action="store_true")
+    c = s.add_parser("confirm-labels")
+    c.add_argument("dir", type=Path)
+    c.add_argument("--ids-from", type=Path, required=True)
     a = ap.parse_args()
 
     if a.cmd == "scan":
         raise SystemExit(scan(a.dir, a.sweep, a.ids_from))
+    if a.cmd == "confirm-labels":
+        raise SystemExit(confirm_labels(a.dir, a.ids_from))
     ids = sorted(pd.read_csv(a.ids_from)["behavior_session_id"].astype(int).unique())
     if not ids:
         raise SystemExit(f"no behavior session IDs found in {a.ids_from}")

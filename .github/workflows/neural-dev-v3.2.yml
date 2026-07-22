@@ -111,7 +111,7 @@ jobs:
           assert result['primary']['K']==50
           assert result['k_policy']['other_K_computed'] is False
           assert result['data_source']['neural_data_release']
-          text=Path('prereg_v3.2.md').read_text().rstrip()
+          text=Path('docs/prereg_v3.2.md').read_text().rstrip()
           anchor=result['anchor']['authoritative_guarded'] or {}
           gates=result['gates']
           lines=['','## DEV-frozen values (authoritative Release snapshot)','',

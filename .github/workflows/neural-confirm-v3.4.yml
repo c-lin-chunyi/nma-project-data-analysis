@@ -1,0 +1,502 @@
+name: neural CONFIRM v3.4 one-shot
+
+run-name: neural CONFIRM v3.4 · ${{ inputs.freeze_release }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      freeze_release:
+        description: 'Exact confirm-v3.4-freeze-* Release tag'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: neural-confirm-v3.4-one-shot
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  open:
+    environment: confirm-v3.4
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      containers: ${{ steps.matrix.outputs.containers }}
+      freeze_sha: ${{ steps.freeze.outputs.freeze_sha }}
+      split_sha: ${{ steps.freeze.outputs.split_sha }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install frozen pipeline
+        run: python -m pip install -r requirements-pipeline.txt
+      - name: Verify freeze, split-lock, and v3.3 before CONFIRM access
+        id: freeze
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FREEZE_TAG: ${{ inputs.freeze_release }}
+        run: |
+          set -euo pipefail
+          case "$FREEZE_TAG" in
+            confirm-v3.4-freeze-?*) ;;
+            *) echo "::error::exact confirm-v3.4-freeze-* tag required"; exit 1 ;;
+          esac
+          test "$(gh release view "$FREEZE_TAG" --json isDraft --jq .isDraft)" = false
+          test "$(gh release view "$FREEZE_TAG" --json targetCommitish --jq .targetCommitish)" = "$GITHUB_SHA"
+          mkdir -p run/freeze run/split-source run/v33-source run/split run/input
+          gh release download "$FREEZE_TAG" -D run/freeze \
+            -p SHA256SUMS -p freeze-manifest.json -p prereg_v3.4.md \
+            -p confirm_v3.4_gh_order.json
+          (cd run/freeze && \
+            grep -E '  (freeze-manifest.json|prereg_v3.4.md|confirm_v3.4_gh_order.json)$' SHA256SUMS | \
+            sha256sum --check -)
+          cmp docs/prereg_v3.4.md run/freeze/prereg_v3.4.md
+          cmp docs/confirm_v3.4_gh_order.json run/freeze/confirm_v3.4_gh_order.json
+          gh release download split-lock -D run/split-source \
+            -p SHA256SUMS -p split.tar.gz
+          (cd run/split-source && \
+            grep -E '  split.tar.gz$' SHA256SUMS | sha256sum --check -)
+          tar -xzf run/split-source/split.tar.gz -C run
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          freeze=json.loads(Path('run/freeze/freeze-manifest.json').read_text())
+          order=json.loads(Path('run/freeze/confirm_v3.4_gh_order.json').read_text())
+          required={
+              'schema','code_commit','prereg_sha256','requirements_sha256',
+              'workflow_order_sha256',
+              'split_release','split_manifest_sha256','v33_release',
+              'v33_manifest_sha256',
+          }
+          assert required <= set(freeze), sorted(required-set(freeze))
+          assert freeze['schema']=='confirm-v3.4-freeze-v1'
+          assert order['schema']=='confirm-v3.4-gh-order-v1'
+          assert freeze['code_commit']==os.environ['GITHUB_SHA']
+          upstream=order['immutable_upstream_releases']
+          assert freeze['split_release']==upstream['split']=='split-lock'
+          assert freeze['v33_release']==upstream['dev_v33_analysis']
+          digest=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          assert digest('run/freeze/prereg_v3.4.md')==freeze['prereg_sha256']
+          assert digest('requirements-pipeline.txt')==freeze['requirements_sha256']
+          assert digest('run/freeze/confirm_v3.4_gh_order.json')==freeze['workflow_order_sha256']
+          assert digest('run/split/split_manifest.json')==freeze['split_manifest_sha256']
+          Path('run/input/v33-tag.txt').write_text(freeze['v33_release']+'\n')
+          PY
+          v33_tag=$(cat run/input/v33-tag.txt)
+          gh release download "$v33_tag" -D run/v33-source \
+            -p analysis-manifest.json -p neural-v3.3-analysis.tar.gz
+          python - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          freeze=json.loads(Path('run/freeze/freeze-manifest.json').read_text())
+          order=json.loads(Path('run/freeze/confirm_v3.4_gh_order.json').read_text())
+          digest=hashlib.sha256(Path('run/v33-source/analysis-manifest.json').read_bytes()).hexdigest()
+          assert digest==freeze['v33_manifest_sha256']
+          source=json.loads(Path('run/v33-source/analysis-manifest.json').read_text())
+          assert source['schema']=='neural-dev-v3.3'
+          assert source['feature_source']['feature_release']==order['immutable_upstream_releases']['dev_feature_cache']
+          PY
+          freeze_sha=$(sha256sum run/freeze/freeze-manifest.json | cut -d' ' -f1)
+          split_sha=$(sha256sum run/split/split_manifest.json | cut -d' ' -f1)
+          echo "freeze_sha=$freeze_sha" >> "$GITHUB_OUTPUT"
+          echo "split_sha=$split_sha" >> "$GITHUB_OUTPUT"
+          cp run/split/confirm_mice.csv run/split/dev_mice.csv run/input/
+          cp run/freeze/freeze-manifest.json run/freeze/prereg_v3.4.md \
+            run/freeze/confirm_v3.4_gh_order.json run/input/
+          cp run/split/split_manifest.json run/input/
+          cp run/v33-source/analysis-manifest.json \
+            run/input/v33-analysis-manifest.json
+      - name: Prove v3.4 Q1 has no DEV drift before access receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p run/dev-cache run/dev-features run/v33-expected
+          feature_tag=$(python -c 'import json; print(json.load(open("run/v33-source/analysis-manifest.json"))["feature_source"]["feature_release"])')
+          case "$feature_tag" in neural-dev-features-v1-*) ;; *) exit 1 ;; esac
+          gh release download "$feature_tag" -D run/dev-cache \
+            -p 'feature-container-*.tar.gz' \
+            -p 'feature-container-*.tar.gz.sha256' \
+            -p dev_experiments.csv -p feature-files.sha256
+          (cd run/dev-cache && sha256sum --check feature-container-*.tar.gz.sha256)
+          for archive in run/dev-cache/feature-container-*.tar.gz; do
+            tar -xzf "$archive" -C run/dev-features
+          done
+          (cd run/dev-features && sha256sum --check ../dev-cache/feature-files.sha256)
+          tar -xzf run/v33-source/neural-v3.3-analysis.tar.gz -C run/v33-expected
+          python pipeline/verify-neural/v34.py dev-q1-equivalence \
+            --features run/dev-features --manifest run/dev-cache/dev_experiments.csv \
+            --expected run/v33-expected --report run/input/dev-q1-equivalence.json
+          rm -rf run/dev-cache run/dev-features run/v33-expected
+      - name: Create or validate immutable pre-access receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FREEZE_TAG: ${{ inputs.freeze_release }}
+          FREEZE_SHA: ${{ steps.freeze.outputs.freeze_sha }}
+          SPLIT_SHA: ${{ steps.freeze.outputs.split_sha }}
+        run: |
+          set -euo pipefail
+          if gh release view confirm-v3.4-access >/dev/null 2>&1; then
+            gh release download confirm-v3.4-access -D run -p access-receipt.json
+            mode=$(python pipeline/verify-neural/v34.py receipt \
+              --path run/access-receipt.json --run-id "$GITHUB_RUN_ID" \
+              --commit "$GITHUB_SHA" --freeze-release "$FREEZE_TAG" \
+              --freeze-sha256 "$FREEZE_SHA" --split-manifest-sha256 "$SPLIT_SHA")
+            test "$mode" = resume
+          else
+            mode=$(python pipeline/verify-neural/v34.py receipt \
+              --path run/access-receipt.json --run-id "$GITHUB_RUN_ID" \
+              --commit "$GITHUB_SHA" --freeze-release "$FREEZE_TAG" \
+              --freeze-sha256 "$FREEZE_SHA" --split-manifest-sha256 "$SPLIT_SHA")
+            test "$mode" = create
+            (cd run && sha256sum access-receipt.json > access-receipt.sha256)
+            gh release create confirm-v3.4-access \
+              run/access-receipt.json run/access-receipt.sha256 \
+              --target "$GITHUB_SHA" --title 'CONFIRM v3.4 data-access receipt' \
+              --notes 'Immutable receipt created before any CONFIRM behavioral or neural access.' \
+              --latest=false
+          fi
+          cp run/access-receipt.json run/input/access-receipt.json
+      - name: Resolve exact active-only CONFIRM manifest after receipt
+        id: matrix
+        run: |
+          set -euo pipefail
+          python pipeline/verify-neural/v34.py manifest \
+            --confirm run/input/confirm_mice.csv --dev run/input/dev_mice.csv \
+            --out run/input/confirm_experiments.csv \
+            --cache "$RUNNER_TEMP/allen-confirm-meta"
+          containers=$(python - <<'PY'
+          import json,pandas as pd
+          table=pd.read_csv('run/input/confirm_experiments.csv')
+          assert len(table)==130 and table.ophys_experiment_id.nunique()==130
+          assert table.mouse_id.nunique()==29 and table.ophys_container_id.nunique()==29
+          assert table.role.eq('active').all()
+          print(json.dumps(sorted(table.ophys_container_id.astype(int).unique().tolist())))
+          PY
+          )
+          echo "containers=$containers" >> "$GITHUB_OUTPUT"
+          sha256sum run/input/confirm_experiments.csv > run/input/confirm-experiments.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: confirm-v3.4-input
+          path: run/input/
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+  behavior-pull:
+    needs: open
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - run: python -m pip install -r requirements-pipeline.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: confirm-v3.4-input
+          path: run/input
+      - name: Pull one frozen behavioral shard
+        run: |
+          mkdir -p run/behavior
+          python pipeline/verify-behavioral/behavioral.py pull \
+            --ids-from run/input/confirm_mice.csv \
+            --shard '${{ matrix.shard }}/13' --out run/behavior \
+            --cache "$RUNNER_TEMP/allen-confirm-behavior" --retries 3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: confirm-behavior-${{ matrix.shard }}
+          path: run/behavior/
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+
+  labels:
+    needs: [open, behavior-pull]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - run: python -m pip install -r requirements-pipeline.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: confirm-v3.4-input
+          path: run/input
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: confirm-behavior-*
+          path: run/behavior
+          merge-multiple: true
+      - name: Produce frozen Piet-B labels only
+        run: |
+          python pipeline/verify-behavioral/behavioral.py confirm-labels run/behavior \
+            --ids-from run/input/confirm_mice.csv
+          mkdir -p run/labels
+          cp run/behavior/_trial_labels.parquet run/behavior/_session_scan.parquet \
+            run/behavior/_eligibility.parquet run/behavior/behavioral-manifest.json \
+            run/labels/
+          (cd run/labels && sha256sum * > label-files.sha256)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: confirm-v3.4-labels
+          path: run/labels/
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+  features:
+    needs: [open, labels]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        container: ${{ fromJSON(needs.open.outputs.containers) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - run: python -m pip install -r requirements-pipeline.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: confirm-v3.4-input
+          path: run/input
+      - uses: actions/download-artifact@v8
+        with:
+          name: confirm-v3.4-labels
+          path: run/labels
+      - name: Verify shard provenance and pull one CONFIRM container
+        env:
+          FREEZE_TAG: ${{ inputs.freeze_release }}
+          FREEZE_SHA: ${{ needs.open.outputs.freeze_sha }}
+          SPLIT_SHA: ${{ needs.open.outputs.split_sha }}
+          CONTAINER: ${{ matrix.container }}
+        run: |
+          set -euo pipefail
+          (cd run/labels && sha256sum --check label-files.sha256)
+          mkdir -p run/neural run/features
+          python pipeline/verify-neural/v34.py pull \
+            --manifest run/input/confirm_experiments.csv --container "$CONTAINER" \
+            --out run/neural --cache "$RUNNER_TEMP/allen-confirm-neural" --retries 3
+          data_sha=$(sha256sum run/input/confirm_experiments.csv | cut -d' ' -f1)
+          python pipeline/verify-neural/v34.py features \
+            --manifest run/input/confirm_experiments.csv --neural run/neural \
+            --behavior run/labels --out run/features --container "$CONTAINER" \
+            --data-release "confirm-v3.4-run-${GITHUB_RUN_ID}" \
+            --data-manifest-sha256 "$data_sha" \
+            --behavioral-release "confirm-v3.4-run-${GITHUB_RUN_ID}"
+          rm -rf run/neural
+          python - <<'PY'
+          import json,os
+          from pathlib import Path
+          value={
+              'schema':'confirm-v3.4-shard-v1',
+              'run_id':int(os.environ['GITHUB_RUN_ID']),
+              'commit':os.environ['GITHUB_SHA'],
+              'freeze_release':os.environ['FREEZE_TAG'],
+              'freeze_sha256':os.environ['FREEZE_SHA'],
+              'split_manifest_sha256':os.environ['SPLIT_SHA'],
+              'container_id':int(os.environ['CONTAINER']),
+          }
+          Path('run/features/_shard-provenance.json').write_text(json.dumps(value,indent=2)+'\n')
+          PY
+          (cd run/features && find . -maxdepth 1 -type f ! -name '_shard-files.sha256' \
+            -print0 | sort -z | xargs -0 sha256sum > _shard-files.sha256)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: confirm-feature-${{ matrix.container }}
+          path: run/features/
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+
+  analyze:
+    needs: [open, features]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - run: python -m pip install -r requirements-pipeline.txt
+      - uses: actions/download-artifact@v8
+        with:
+          name: confirm-v3.4-input
+          path: run/input
+      - uses: actions/download-artifact@v8
+        with:
+          name: confirm-v3.4-labels
+          path: run/labels
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: confirm-feature-*
+          path: run/shards
+      - name: Accept only exact same-run resumable shards
+        env:
+          FREEZE_TAG: ${{ inputs.freeze_release }}
+          FREEZE_SHA: ${{ needs.open.outputs.freeze_sha }}
+          SPLIT_SHA: ${{ needs.open.outputs.split_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p run/features run/analysis
+          python - <<'PY'
+          import json,os,shutil,subprocess
+          from pathlib import Path
+          roots=sorted(Path('run/shards').glob('confirm-feature-*'))
+          assert len(roots)==29, f'expected 29 container shards, got {len(roots)}'
+          expected={
+              'schema':'confirm-v3.4-shard-v1',
+              'run_id':int(os.environ['GITHUB_RUN_ID']),
+              'commit':os.environ['GITHUB_SHA'],
+              'freeze_release':os.environ['FREEZE_TAG'],
+              'freeze_sha256':os.environ['FREEZE_SHA'],
+              'split_manifest_sha256':os.environ['SPLIT_SHA'],
+          }
+          containers=set()
+          for root in roots:
+              subprocess.run(['sha256sum','--check','_shard-files.sha256'],cwd=root,check=True)
+              value=json.loads((root/'_shard-provenance.json').read_text())
+              assert all(value.get(k)==v for k,v in expected.items()), f'provenance mismatch: {root}'
+              assert value['container_id'] not in containers
+              containers.add(value['container_id'])
+              for path in root.iterdir():
+                  if path.name[:1].isdigit():
+                      target=Path('run/features')/path.name
+                      assert not target.exists(), f'duplicate feature file {path.name}'
+                      shutil.copy2(path,target)
+          assert len(containers)==29
+          PY
+          python pipeline/verify-neural/v34.py feature-verify \
+            --manifest run/input/confirm_experiments.csv --features run/features \
+            --report run/analysis/feature-cache-validation.json \
+            --data-release "confirm-v3.4-run-${GITHUB_RUN_ID}" \
+            --data-manifest-sha256 "$(sha256sum run/input/confirm_experiments.csv | cut -d' ' -f1)" \
+            --behavioral-release "confirm-v3.4-run-${GITHUB_RUN_ID}"
+      - name: Run Q1 primary and Q2 descriptive secondary unconditionally
+        env:
+          FREEZE_SHA: ${{ needs.open.outputs.freeze_sha }}
+        run: |
+          set -o pipefail
+          manifest_sha=$(sha256sum run/input/confirm_experiments.csv | cut -d' ' -f1)
+          python pipeline/verify-neural/v34.py scan \
+            --features run/features --manifest run/input/confirm_experiments.csv \
+            --out run/analysis --feature-release "confirm-v3.4-run-${GITHUB_RUN_ID}" \
+            --feature-manifest-sha256 "$manifest_sha" \
+            2>&1 | tee run/analysis/analysis.log
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          result=json.loads(Path('run/analysis/analysis-manifest.json').read_text())
+          assert result['schema']=='neural-confirm-v3.4'
+          assert result['outcome'] in {
+              'confirmatory_supported','confirmatory_not_supported',
+              'nonestimable_coverage','nonestimable_interval'}
+          assert result['primary']['SESOI']==0.55
+          assert result['secondary']['changes_primary_decision'] is False
+          assert result['integrity']['state_analysis_run'] is False
+          assert result['integrity']['v4_run'] is False
+          PY
+          python -m pip freeze > run/analysis/environment.txt
+          (cd run/labels && sha256sum --check label-files.sha256)
+          cp docs/prereg_v3.4.md run/input/confirm_v3.4_gh_order.json \
+            run/input/freeze-manifest.json \
+            run/input/confirm_mice.csv run/input/dev_mice.csv \
+            run/input/confirm_experiments.csv run/input/confirm-experiments.sha256 \
+            run/input/split_manifest.json run/input/v33-analysis-manifest.json \
+            run/input/access-receipt.json run/input/dev-q1-equivalence.json \
+            run/labels/behavioral-manifest.json \
+            run/labels/label-files.sha256 \
+            run/analysis/
+          sha256sum requirements-pipeline.txt > run/analysis/environment-input.sha256
+          python - <<'PY'
+          import datetime,hashlib,json,os
+          from pathlib import Path
+          digest=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          provenance={
+              'schema':'neural-confirm-v3.4-provenance-v1',
+              'date_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'run_id':int(os.environ['GITHUB_RUN_ID']),
+              'workflow_run':f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'code_commit':os.environ['GITHUB_SHA'],
+              'freeze_manifest_sha256':digest('run/input/freeze-manifest.json'),
+              'split_manifest_sha256':digest('run/input/split_manifest.json'),
+              'v33_manifest_sha256':digest('run/input/v33-analysis-manifest.json'),
+              'confirm_experiment_manifest_sha256':digest('run/input/confirm_experiments.csv'),
+              'requirements_sha256':digest('requirements-pipeline.txt'),
+              'confirm_data_accessed':True,
+          }
+          Path('run/analysis/provenance.json').write_text(json.dumps(provenance,indent=2)+'\n')
+          PY
+          (cd run/analysis && find . -maxdepth 1 -type f ! -name SHA256SUMS \
+            -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: neural-confirm-v3.4-result
+          path: run/analysis/
+          retention-days: 30
+          if-no-files-found: warn
+          overwrite: true
+
+  publish:
+    needs: [open, analyze]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: neural-confirm-v3.4-result
+          path: assets
+      - name: Publish immutable result for every statistical outcome
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FREEZE_SHA: ${{ needs.open.outputs.freeze_sha }}
+        run: |
+          set -euo pipefail
+          (cd assets && sha256sum --check SHA256SUMS)
+          outcome=$(python -c 'import json; print(json.load(open("assets/analysis-manifest.json"))["outcome"])')
+          tag="neural-confirm-v3.4-${FREEZE_SHA}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            test "$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)" = "$GITHUB_SHA"
+            echo "$tag already published immutably for this freeze"
+            exit 0
+          fi
+          printf '# Neural CONFIRM v3.4\n\n- Frozen input: `%s`\n- Code: `%s`\n- Statistical outcome: `%s`\n- Q1 SESOI: `0.55`\n- Q2 role: descriptive secondary\n' \
+            "$FREEZE_SHA" "$GITHUB_SHA" "$outcome" > release-notes.md
+          gh release create "$tag" assets/* --target "$GITHUB_SHA" \
+            --title "$tag: $outcome" --notes-file release-notes.md \
+            --latest=false

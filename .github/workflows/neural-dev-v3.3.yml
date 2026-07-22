@@ -121,7 +121,7 @@ jobs:
           assert result['primary']['K']==50 and result['primary']['C']==1e-4
           assert result['primary']['session_estimator']=='pooled_oof_auc'
           anchor=result['anchor']['guarded']
-          text=Path('prereg_v3.3.md').read_text().rstrip()
+          text=Path('docs/prereg_v3.3.md').read_text().rstrip()
           lines=[
               '', '## DEV-frozen values (authoritative Release snapshot)', '',
               f"- `Feature cache Release = {result['feature_source']['feature_release']}`",

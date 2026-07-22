@@ -61,6 +61,48 @@ class FakeSession:
 
 
 class BehavioralTests(unittest.TestCase):
+    def test_confirm_labels_is_exact_and_label_only(self):
+        rows = []
+        bsid = 1000
+        for mouse in range(29):
+            count = 5 if mouse < 14 else 4
+            for session in range(count):
+                rows.append({
+                    "behavior_session_id": bsid,
+                    "ophys_experiment_id": bsid + 10000,
+                    "ophys_container_id": 2000 + mouse,
+                    "mouse_id": 3000 + mouse,
+                    "project_code": "VisualBehavior",
+                    "session_type": f"OPHYS_{1 + session % 6}_images_A",
+                })
+                bsid += 1
+        expected = pd.DataFrame(rows)
+        labels = pd.DataFrame({
+            "trial_id": [1], "trial_index": [0], "start_time": [0.0],
+            "stop_time": [1.0], "change_time": [.5], "late_hit": [True],
+            "miss": [False], "engaged_B": [True], "keep_B": [True],
+            "first_ten": [False], "is_image_novel": [False],
+        })
+        session = {"late_hit_B": 20, "miss_B": 20}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ids_path = root / "confirm.csv"
+            expected.to_csv(ids_path, index=False)
+            with mock.patch.object(
+                    behavioral, "validate_bundle_set",
+                    return_value=expected.behavior_session_id.tolist()), \
+                    mock.patch.object(behavioral, "load", return_value=(
+                        None, None, None, None, None)), \
+                    mock.patch.object(behavioral, "label_session",
+                                      return_value=(labels, session, {})):
+                self.assertEqual(behavioral.confirm_labels(root, ids_path), 0)
+            manifest = json.loads((root / "behavioral-manifest.json").read_text())
+            self.assertEqual(manifest["schema"], "behavioral-confirm-v3.4")
+            self.assertEqual(manifest["n_sessions"], 130)
+            self.assertFalse(manifest["construct_sweep_performed"])
+            self.assertFalse(manifest["threshold_sweep_performed"])
+            self.assertFalse((root / "_sweep.parquet").exists())
+
     def test_shard_validation(self):
         self.assertEqual(behavioral.parse_shard("3/10"), (3, 10))
         for value in ("0/10", "11/10", "1/0", "abc", "1/2/3"):

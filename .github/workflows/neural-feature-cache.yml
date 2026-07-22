@@ -180,7 +180,7 @@ jobs:
           sha256sum requirements-pipeline.txt > assets/environment-input.sha256
           cp run/data-source/dev_experiments.csv run/data-source/data-package-manifest.json \
             run/data-source/behavioral-manifest.json run/feature-files.sha256 \
-            run/feature-cache-validation.json prereg_v3.3.md assets/
+            run/feature-cache-validation.json docs/prereg_v3.3.md assets/
           python - <<'PY'
           import datetime, hashlib, json, os, platform
           from pathlib import Path

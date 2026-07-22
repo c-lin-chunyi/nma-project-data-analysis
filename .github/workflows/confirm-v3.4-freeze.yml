@@ -1,0 +1,94 @@
+name: freeze CONFIRM v3.4 preregistration
+
+run-name: freeze CONFIRM v3.4 · ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: confirm-v3.4-freeze-once
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  SPLIT_RELEASE: split-lock
+  DEV_FEATURE_RELEASE: neural-dev-features-v1-29482249873
+  V33_RELEASE: neural-dev-v3.3-29551296569
+
+jobs:
+  freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install frozen pipeline
+        run: python -m pip install -r requirements-pipeline.txt
+      - name: Resolve exact immutable public prerequisites
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh release list --limit 100 --json tagName --jq '[.[] | select(.tagName | startswith("confirm-v3.4-freeze-"))] | length')" = 0
+          if gh release view confirm-v3.4-access >/dev/null 2>&1; then
+            echo "::error::CONFIRM access receipt already exists; a new freeze is forbidden"
+            exit 1
+          fi
+          mkdir -p run/split-source run/v33-source run/split run/freeze
+          test "$(gh release view "$SPLIT_RELEASE" --json isDraft --jq .isDraft)" = false
+          test "$(gh release view "$V33_RELEASE" --json isDraft --jq .isDraft)" = false
+          test "$(gh release view "$DEV_FEATURE_RELEASE" --json isDraft --jq .isDraft)" = false
+          gh release download "$SPLIT_RELEASE" -D run/split-source \
+            -p SHA256SUMS -p split.tar.gz
+          (cd run/split-source && \
+            grep -E '  split.tar.gz$' SHA256SUMS | sha256sum --check -)
+          tar -xzf run/split-source/split.tar.gz -C run
+          gh release download "$V33_RELEASE" -D run/v33-source \
+            -p analysis-manifest.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest=json.loads(Path('run/v33-source/analysis-manifest.json').read_text())
+          assert manifest['schema']=='neural-dev-v3.3'
+          assert manifest['feature_source']['feature_release']==os.environ['DEV_FEATURE_RELEASE']
+          PY
+      - name: Build the pre-access freeze contract
+        run: |
+          set -euo pipefail
+          python pipeline/verify-neural/v34.py freeze-manifest \
+            --out run/freeze/freeze-manifest.json \
+            --code-commit "$GITHUB_SHA" \
+            --prereg docs/prereg_v3.4.md \
+            --requirements requirements-pipeline.txt \
+            --workflow-order docs/confirm_v3.4_gh_order.json \
+            --split-release "$SPLIT_RELEASE" \
+            --split-manifest run/split/split_manifest.json \
+            --v33-release "$V33_RELEASE" \
+            --v33-manifest run/v33-source/analysis-manifest.json
+          cp docs/prereg_v3.4.md docs/confirm_v3.4_gh_order.json run/freeze/
+          cp run/split/split_manifest.json run/v33-source/analysis-manifest.json run/freeze/
+          (cd run/freeze && sha256sum \
+            freeze-manifest.json prereg_v3.4.md confirm_v3.4_gh_order.json \
+            split_manifest.json analysis-manifest.json > SHA256SUMS)
+      - name: Publish exactly one immutable freeze Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="confirm-v3.4-freeze-${GITHUB_SHA}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::freeze Release already exists: $tag"
+            exit 1
+          fi
+          gh release create "$tag" run/freeze/* \
+            --target "$GITHUB_SHA" \
+            --title "CONFIRM v3.4 frozen preregistration" \
+            --notes "Pre-access freeze. No CONFIRM behavior, neural data, or derived features were accessed by this workflow."
+          echo "Use exact one-shot input: \`$tag\`" >> "$GITHUB_STEP_SUMMARY"

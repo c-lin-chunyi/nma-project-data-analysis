@@ -468,7 +468,8 @@ def _json_scalar(value):
 def _write_feature_cache_experiment(source: Path, out: Path, row,
                                     labels: pd.DataFrame, *, data_release: str,
                                     data_manifest_sha256: str,
-                                    behavioral_release: str) -> None:
+                                    behavioral_release: str,
+                                    feature_schema: str = FEATURE_CACHE_SCHEMA) -> None:
     """Atomically materialize fold-independent active-session model matrices."""
     import h5py
     oeid, bsid = int(row.ophys_experiment_id), int(row.behavior_session_id)
@@ -541,7 +542,7 @@ def _write_feature_cache_experiment(source: Path, out: Path, row,
         chunks = (min(256, len(trial_ids)), min(64, len(cells)))
         with h5py.File(feature_path, "w") as h5:
             h5.attrs.update({
-                "schema": FEATURE_CACHE_SCHEMA,
+                "schema": feature_schema,
                 "ophys_experiment_id": oeid,
                 "behavior_session_id": bsid,
                 "neural_data_release": data_release,
@@ -560,7 +561,7 @@ def _write_feature_cache_experiment(source: Path, out: Path, row,
         identity = {column: _json_scalar(getattr(row, column))
                     for column in row._fields}
         metadata = {
-            "schema": FEATURE_CACHE_SCHEMA,
+            "schema": feature_schema,
             "identity": identity,
             "neural_data_release": data_release,
             "data_manifest_sha256": data_manifest_sha256,
@@ -590,7 +591,9 @@ def _write_feature_cache_experiment(source: Path, out: Path, row,
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def feature_cache_failures(root: Path, manifest: pd.DataFrame) -> list[dict]:
+def feature_cache_failures(root: Path, manifest: pd.DataFrame, *,
+                           feature_schema: str = FEATURE_CACHE_SCHEMA,
+                           expected_provenance: dict | None = None) -> list[dict]:
     """Validate the exact active feature package without touching neural NWBs."""
     import h5py
     active = manifest[manifest.role.eq("active")].copy()
@@ -618,15 +621,21 @@ def feature_cache_failures(root: Path, manifest: pd.DataFrame) -> list[dict]:
             labels = pd.read_parquet(root / f"{oeid}.labels.parquet")
             q2 = pd.read_parquet(root / f"{oeid}.q2.parquet")
             metadata = json.loads((root / f"{oeid}.feature-meta.json").read_text())
-            if metadata.get("schema") != FEATURE_CACHE_SCHEMA:
+            if metadata.get("schema") != feature_schema:
                 problems.append("metadata_schema")
             if int(metadata.get("identity", {}).get("ophys_experiment_id", -1)) != oeid:
                 problems.append("metadata_experiment_id")
+            for key, expected in (expected_provenance or {}).items():
+                if metadata.get(key) != expected:
+                    problems.append(f"metadata_provenance:{key}")
             with h5py.File(root / f"{oeid}.features.h5", "r") as h5:
-                if h5.attrs.get("schema") != FEATURE_CACHE_SCHEMA:
+                if h5.attrs.get("schema") != feature_schema:
                     problems.append("h5_schema")
                 if int(h5.attrs.get("behavior_session_id", -1)) != bsid:
                     problems.append("h5_behavior_session_id")
+                for key, expected in (expected_provenance or {}).items():
+                    if h5.attrs.get(key) != expected:
+                        problems.append(f"h5_provenance:{key}")
                 required = {"trial_id", "cell_specimen_id", *FEATURE_DATASETS}
                 problems.extend(f"missing_h5:{name}"
                                 for name in sorted(required-set(h5.keys())))

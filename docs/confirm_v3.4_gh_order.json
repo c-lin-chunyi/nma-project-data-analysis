@@ -1,0 +1,41 @@
+{
+  "schema": "confirm-v3.4-gh-order-v1",
+  "immutable_upstream_releases": {
+    "split": "split-lock",
+    "dev_feature_cache": "neural-dev-features-v1-29482249873",
+    "dev_v33_analysis": "neural-dev-v3.3-29551296569"
+  },
+  "github_workflows": [
+    {
+      "order": 1,
+      "file": ".github/workflows/confirm-v3.4-freeze.yml",
+      "name": "freeze CONFIRM v3.4 preregistration",
+      "access_boundary": "public DEV and split metadata only",
+      "output": "confirm-v3.4-freeze-<40-character-code-commit>"
+    },
+    {
+      "order": 2,
+      "file": ".github/workflows/neural-confirm-v3.4.yml",
+      "name": "neural CONFIRM v3.4 one-shot",
+      "input": "the exact Release tag emitted by order 1",
+      "approval_environment": "confirm-v3.4",
+      "access_boundary": "CONFIRM access only after preflight and access receipt"
+    }
+  ],
+  "one_shot_job_order": [
+    "open",
+    "behavior-pull",
+    "labels",
+    "features",
+    "analyze",
+    "publish"
+  ],
+  "open_pre_access_order": [
+    "verify freeze, split-lock, v3.3 manifest, and this order contract",
+    "replay the frozen Q1 kernel against the exact public DEV v3.3 outputs",
+    "create or validate the immutable confirm-v3.4-access receipt",
+    "resolve and validate the exact active CONFIRM manifest"
+  ],
+  "freeze_policy": "The freeze workflow refuses to run if any confirm-v3.4-freeze-* Release or the confirm-v3.4-access receipt already exists.",
+  "rerun_policy": "Only a GitHub rerun with the original run ID and identical provenance may resume; a new dispatch is refused after the access receipt exists."
+}

@@ -74,7 +74,7 @@ jobs:
           cp run/bundles/_*.parquet scan/
           cp run/bundles/_*.json scan/ 2>/dev/null || true
           cp run/bundles/behavioral-manifest.json run/bundles/scan-v3.1.log scan/
-          cp prereg_v3.1.md scan/
+          cp docs/prereg_v3.1.md scan/
           tar -czf assets/behavioral-v3.1-scan.tar.gz -C scan .
           cp run/source/dev-bundles.tar.gz assets/dev-bundles.tar.gz
           cp run/source/source-split.tar.gz assets/source-split.tar.gz

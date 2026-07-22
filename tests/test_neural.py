@@ -303,13 +303,13 @@ class NeuralTests(unittest.TestCase):
         self.assertIn("has no manifest experiments", workflow)
 
     def test_v32_prereg_freezes_unbaselined_prechange_anchor(self):
-        text = (ROOT / "prereg_v3.2.md").read_text()
+        text = (ROOT / "docs/prereg_v3.2.md").read_text()
         self.assertIn("unbaselined events mean in `[-1,0)`", text)
         self.assertIn("K=50 remains the only authoritative", text)
         self.assertIn("Q2 precision requires", text)
 
     def test_v33_prereg_freezes_conditional_anchor_cache_and_nested_q2(self):
-        text = (ROOT / "prereg_v3.3.md").read_text()
+        text = (ROOT / "docs/prereg_v3.3.md").read_text()
         self.assertIn("neural-dev-features-v1-*", text)
         self.assertIn("fold-independent", text)
         self.assertIn("AUC_cond", text)

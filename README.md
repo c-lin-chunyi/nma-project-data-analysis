@@ -43,6 +43,28 @@ calibration, and evaluation rather than tree-based decision logic.
 The editable diagram source is
 [`docs/v33-model-workflow.d2`](docs/v33-model-workflow.d2).
 
+## v3.4 CONFIRM workflow
+
+The frozen [v3.4 preregistration](docs/prereg_v3.4.md) makes v3.3 Q1 the sole
+confirmatory primary and retains Q2 as descriptive secondary.  The exact,
+machine-checked [GitHub execution contract](docs/confirm_v3.4_gh_order.json) is:
+
+1. Run **freeze CONFIRM v3.4 preregistration** once; it publishes
+   `confirm-v3.4-freeze-<code-commit>` without CONFIRM data access.
+2. From the same commit, run **neural CONFIRM v3.4 one-shot** with precisely that
+   freeze tag.  Do not rerun the historical DEV workflows.
+
+Approval of the `confirm-v3.4` GitHub
+Environment creates the irreversible `confirm-v3.4-access` receipt before any
+CONFIRM data read.  A second dispatch is refused; only the same GitHub run may
+resume checksum- and provenance-matched shards.
+
+The workflow extracts active experiments only, verifies the exact 130-session /
+29-container / 29-mouse manifest, runs Q1 and Q2 unconditionally, and publishes
+`neural-confirm-v3.4-<freeze-sha>` for supported, unsupported, and statistical
+nonestimability outcomes.  Integrity or pipeline failures do not produce a
+statistical conclusion.
+
 ## v4 DEV workflow
 
 v4 uses its own Python 3.11 environment (`requirements-v4.txt`) and does not
