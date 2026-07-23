@@ -306,8 +306,11 @@ def coverage_counts(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _configure_matplotlib(font_dir: Path) -> tuple[object, object, object]:
     import matplotlib
+    from matplotlib import font_manager
 
     matplotlib.use("pgf")
+    for name in FONT_FILES:
+        font_manager.fontManager.addfont(font_dir / name)
     escaped = font_dir.resolve().as_posix().replace("#", r"\#") + "/"
     preamble = "\n".join(
         (

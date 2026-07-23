@@ -311,6 +311,7 @@ class V34PlotDataTests(unittest.TestCase):
         self.assertNotIn("features.h5", workflow)
         self.assertNotIn("--clobber", workflow)
         self.assertIn('.removeprefix("./")', workflow)
+        self.assertIn("texlive-fonts-recommended", workflow)
         for name in plots.SOURCE_FILES:
             self.assertIn(name, workflow)
 

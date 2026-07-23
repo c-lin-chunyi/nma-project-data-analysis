@@ -40,7 +40,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            poppler-utils texlive-xetex
+            poppler-utils texlive-fonts-recommended texlive-xetex
           python -m pip install -r requirements-plot.txt
           xelatex --version
           pdftocairo -v
