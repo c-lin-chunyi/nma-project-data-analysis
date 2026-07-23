@@ -1,0 +1,7 @@
+# Reproducible v3.4 publication-figure environment.
+# Interpreter contract: CPython 3.11.x.
+numpy==2.3.5
+pandas==3.0.3
+pyarrow==25.0.0
+matplotlib==3.11.1
+seaborn==0.13.2

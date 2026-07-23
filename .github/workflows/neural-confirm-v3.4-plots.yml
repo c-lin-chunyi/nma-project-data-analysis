@@ -1,0 +1,216 @@
+name: neural CONFIRM v3.4 publication figures
+
+run-name: neural CONFIRM v3.4 plots · ${{ inputs.analysis_release }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      analysis_release:
+        description: 'Exact public neural-confirm-v3.4-<sha256> Release tag'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: neural-confirm-v3.4-plots-${{ inputs.analysis_release }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  render-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-plot.txt
+
+      - name: Install pinned plotting and typesetting environment
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            poppler-utils texlive-xetex
+          python -m pip install -r requirements-plot.txt
+          xelatex --version
+          pdftocairo -v
+
+      - name: Run plotting unit and synthetic render tests
+        env:
+          SOURCE_DATE_EPOCH: '1704067200'
+          MPLCONFIGDIR: ${{ runner.temp }}/matplotlib-tests
+          XDG_CACHE_HOME: ${{ runner.temp }}/cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME"
+          python -m unittest tests.test_v34_plots -v
+
+      - name: Download and verify the immutable public result
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.analysis_release }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_TAG" =~ ^neural-confirm-v3\.4-[0-9a-f]{64}$ ]]; then
+            echo "::error::analysis_release must be neural-confirm-v3.4-<64 lowercase hex>"
+            exit 1
+          fi
+          test "$(gh release view "$SOURCE_TAG" --json isDraft --jq .isDraft)" = false
+          published_at="$(gh release view "$SOURCE_TAG" --json publishedAt --jq .publishedAt)"
+          source_epoch="$(date -u -d "$published_at" +%s)"
+          source_sha="${SOURCE_TAG#neural-confirm-v3.4-}"
+          mkdir -p run/source
+          gh release download "$SOURCE_TAG" -D run/source \
+            -p SHA256SUMS \
+            -p analysis-manifest.json \
+            -p q1_sessions.parquet \
+            -p q1_mice.parquet \
+            -p q1_fold_diagnostics.parquet \
+            -p q2_mice.parquet \
+            -p q2_C_selection.parquet \
+            -p coverage_failures.parquet
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("run/source")
+          required = {
+              "analysis-manifest.json",
+              "q1_sessions.parquet",
+              "q1_mice.parquet",
+              "q1_fold_diagnostics.parquet",
+              "q2_mice.parquet",
+              "q2_C_selection.parquet",
+              "coverage_failures.parquet",
+          }
+          registered = {}
+          for line in (root / "SHA256SUMS").read_text().splitlines():
+              digest, name = line.split(maxsplit=1)
+              registered[name.lstrip("*").removeprefix("./")] = digest
+          assert required <= registered.keys(), sorted(required - registered.keys())
+          for name in sorted(required):
+              path = root / name
+              assert path.is_file(), name
+              actual = hashlib.sha256(path.read_bytes()).hexdigest()
+              assert actual == registered[name], (name, actual, registered[name])
+          manifest = json.loads((root / "analysis-manifest.json").read_text())
+          assert manifest["schema"] == "neural-confirm-v3.4"
+          assert manifest["confirm_data_accessed"] is True
+          assert manifest["primary"]["SESOI"] == 0.55
+          PY
+          echo "source_epoch=$source_epoch" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Render APA figures with STIX Two and XeLaTeX
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.source.outputs.source_epoch }}
+          MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
+        run: |
+          set -euo pipefail
+          mkdir -p "$MPLCONFIGDIR" run/plots
+          python pipeline/draw/v34_plots.py \
+            --input run/source \
+            --output run/plots \
+            --source-release '${{ inputs.analysis_release }}' \
+            --font-dir assets/fonts/stix2 \
+            > run/plots/render.log
+          python -m pip freeze --all > run/plots/environment.txt
+
+      - name: Verify formats, resolution, pages, fonts, and provenance
+        run: |
+          set -euo pipefail
+          test "$(find run/plots -maxdepth 1 -name '*.pgf' | wc -l)" = 8
+          test "$(find run/plots -maxdepth 1 -name '*.pdf' | wc -l)" = 8
+          test "$(find run/plots -maxdepth 1 -name '*.svg' | wc -l)" = 8
+          test "$(find run/plots -maxdepth 1 -name '*.png' | wc -l)" = 8
+          : > run/plots/pdf-fonts.txt
+          for pdf in run/plots/*.pdf; do
+            test "$(pdfinfo "$pdf" | awk '/^Pages:/ {print $2}')" = 1
+            pdffonts "$pdf" | tee -a run/plots/pdf-fonts.txt
+            pdffonts "$pdf" | grep -Eq 'STIXTwoText'
+          done
+          grep -Eq 'STIXTwoMath' run/plots/pdf-fonts.txt
+          python - <<'PY'
+          import json
+          import struct
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          root = Path("run/plots")
+          manifest = json.loads((root / "plot-manifest.json").read_text())
+          assert manifest["schema"] == "neural-confirm-v3.4-plots-v1"
+          assert manifest["source"]["release"] == "${{ inputs.analysis_release }}"
+          assert manifest["plot_code_commit"] == "${{ github.sha }}"
+          assert manifest["confirm_raw_data_accessed"] is False
+          assert manifest["models_refit"] is False
+          assert manifest["registered_intervals_recomputed"] is False
+          assert len(manifest["figures"]) == 8
+          for path in sorted(root.glob("*.svg")):
+              ET.parse(path)
+          for path in sorted(root.glob("*.png")):
+              data = path.read_bytes()
+              assert data[:8] == b"\x89PNG\r\n\x1a\n"
+              offset = 8
+              pixels_per_meter = None
+              while offset < len(data):
+                  length = struct.unpack(">I", data[offset:offset + 4])[0]
+                  kind = data[offset + 4:offset + 8]
+                  payload = data[offset + 8:offset + 8 + length]
+                  if kind == b"pHYs":
+                      xppm, yppm, unit = struct.unpack(">IIB", payload)
+                      assert unit == 1 and xppm == yppm
+                      pixels_per_meter = xppm
+                      break
+                  offset += 12 + length
+              assert pixels_per_meter is not None, path
+              dpi = pixels_per_meter * 0.0254
+              assert abs(dpi - 600) < 1, (path, dpi)
+          PY
+          (cd run/plots && \
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | \
+            sort -z | xargs -0 sha256sum > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: neural-confirm-v3.4-plots-${{ steps.source.outputs.source_sha }}
+          path: run/plots/
+          retention-days: 30
+          if-no-files-found: warn
+          overwrite: true
+
+      - name: Publish a separate immutable figure Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.analysis_release }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          plot_tag="neural-confirm-v3.4-plots-${SOURCE_SHA}-${GITHUB_SHA}"
+          if gh release view "$plot_tag" >/dev/null 2>&1; then
+            test "$(gh release view "$plot_tag" --json targetCommitish --jq .targetCommitish)" = "$GITHUB_SHA"
+            mkdir -p run/existing
+            gh release download "$plot_tag" -D run/existing -p plot-manifest.json
+            cmp run/plots/plot-manifest.json run/existing/plot-manifest.json
+            echo "$plot_tag already contains the identical immutable figure manifest"
+            exit 0
+          fi
+          printf '# Neural CONFIRM v3.4 publication figures\n\n- Source result: `%s`\n- Plot code: `%s`\n- Text font: STIX Two Text 2.13 b171\n- Math font: STIX Two Math 2.13 b171\n- Primary formats: PDF, SVG, PNG (600 dpi), and PGF\n' \
+            "$SOURCE_TAG" "$GITHUB_SHA" > release-notes.md
+          gh release create "$plot_tag" run/plots/* \
+            --target "$GITHUB_SHA" \
+            --title "$plot_tag" \
+            --notes-file release-notes.md \
+            --latest=false

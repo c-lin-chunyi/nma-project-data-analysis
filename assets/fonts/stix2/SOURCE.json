@@ -1,0 +1,15 @@
+{
+  "family": "STIX Two",
+  "version": "2.13 b171",
+  "tag": "v2.13b171",
+  "source": "https://github.com/stipub/stixfonts/releases/tag/v2.13b171",
+  "license": "SIL Open Font License 1.1",
+  "files": {
+    "OFL.txt": "0c8825913b60d858aacdb33c4ca6660a7d64b0d6464702efbb19313f5765861a",
+    "STIXTwoMath-Regular.otf": "3a5f3f26f40d5698b3c62dd085d48d6663696a3f80825aab8b553d5097518e8c",
+    "STIXTwoText-Bold.otf": "7ef76c666a6704f76ed3fa27bcdda55b36e558b5c2c93b49b03d854db96bdeb5",
+    "STIXTwoText-BoldItalic.otf": "90e88f2ac79d6c00a5ce2d8446bfdf9457aed6afc1159cde33262979d82c8586",
+    "STIXTwoText-Italic.otf": "cd64481fd10b69469074a3a8172fb5a22cb4116941d8aceafb8c77756b563df8",
+    "STIXTwoText-Regular.otf": "c4864ca6ec071c2d31d0d8309001faa1ee3517fffb53a31a405a697b71f52ca1"
+  }
+}
